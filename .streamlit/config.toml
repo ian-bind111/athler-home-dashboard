@@ -1,0 +1,13 @@
+[bind]
+name = "athler 홈 영역 대시보드"
+
+[server]
+headless = true
+
+[theme]
+base = "dark"
+primaryColor = "#3182F6"
+backgroundColor = "#17171C"
+secondaryBackgroundColor = "#1F1F26"
+textColor = "#F2F4F6"
+font = "sans serif"

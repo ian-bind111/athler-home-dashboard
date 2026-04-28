@@ -1,0 +1,19 @@
+# 민감 파일 (API 키 등) — 절대 커밋 금지
+.env
+.env.*
+.streamlit/secrets.toml
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 테스트/디버깅 파일
+_test_*.py
+_screenshot_*.png
+
+# OS
+.DS_Store
+Thumbs.db
