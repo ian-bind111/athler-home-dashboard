@@ -306,6 +306,9 @@ def get_banner_clicks_for_attribution(start_date: date, end_date: date,
     Athena: 기간 내 홈/아울렛 배너 클릭 이벤트 raw 추출 (last-touch 매칭용)
     user_id로 MySQL users_user.id와 직접 매칭. 비로그인 사용자(user_id 없음)는 제외.
 
+    중요: Athena `time` 컬럼은 epoch 밀리초이므로 1000으로 나눠서 초로 통일.
+    MySQL UNIX_TIMESTAMP()는 초 단위이므로 같은 단위로 비교 가능.
+
     반환 컬럼: user_id, section_uuid, banner_idx, click_time (Unix timestamp, 초)
     """
     date_filter = _date_conditions(start_date, end_date)
@@ -314,7 +317,7 @@ SELECT
     user_id,
     element_uuid        AS section_uuid,
     CAST(idx AS BIGINT) AS banner_idx,
-    time                AS click_time
+    CAST(time / 1000 AS BIGINT) AS click_time
 FROM {TABLE}
 WHERE {date_filter}
   AND event = 'click_content'
