@@ -356,6 +356,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_section_clicks,
             get_banner_clicks_by_position,
             get_page_visitors,
+            get_banner_last_touch_gmv2,
         )
         page_name = page_config["page_name"]
         view_event = page_config["view_event"]
@@ -368,10 +369,19 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             view_event_name=view_event,
             page_name=view_page_name,
         )
+        # Last-touch GMV2 (클릭 후 7일 이내 결제 귀속): 실패해도 본 데이터 유지
+        gmv2_error = None
+        try:
+            banner_gmv2 = get_banner_last_touch_gmv2(start_date, end_date, page_name=page_name)
+        except Exception as e:
+            banner_gmv2 = pd.DataFrame()
+            gmv2_error = f"{type(e).__name__}: {e}"
         return {
-            "section_clicks":   sec_clicks,
+            "section_clicks":    sec_clicks,
             "banner_pos_clicks": banner_pos,
-            "home_visitors":    visitors,
+            "home_visitors":     visitors,
+            "banner_gmv2":       banner_gmv2,
+            "gmv2_error":        gmv2_error,
             "source": "live",
         }
     except Exception as e:
@@ -432,10 +442,31 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         })
     visitor_df = pd.DataFrame(visitor_rows)
 
+    # 데모용 last-touch GMV2 (배너별)
+    gmv2_rows = []
+    for _, b in banners_df.iterrows():
+        idx_val = str(int(b.get("banner_orderIndex", 1)) - 1)
+        orders = max(0, int(rng.integers(0, 50)))
+        if orders == 0:
+            continue
+        gmv2_rows.append({
+            "section_uuid":     b["section_uuid"],
+            "banner_idx":       idx_val,
+            "attributed_gmv2":  int(orders * rng.integers(30000, 90000)),
+            "attributed_orders": orders,
+            "attributed_users":  int(orders * rng.uniform(0.7, 1.0)),
+        })
+    banner_gmv2_df = pd.DataFrame(gmv2_rows) if gmv2_rows else pd.DataFrame(
+        columns=["section_uuid", "banner_idx",
+                 "attributed_gmv2", "attributed_orders", "attributed_users"]
+    )
+
     return {
         "section_clicks": sec_click_df,
         "banner_pos_clicks": banner_pos_df,
         "home_visitors": visitor_df,
+        "banner_gmv2": banner_gmv2_df,
+        "gmv2_error": None,
         "source": "demo",
     }
 
@@ -444,8 +475,9 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
 # 7. 집계 함수
 # ──────────────────────────────────────────────
 def build_section_summary(sections_df: pd.DataFrame, sec_click_df: pd.DataFrame,
-                           visitor_df: pd.DataFrame) -> pd.DataFrame:
-    """섹션별 클릭 합산 + 메타 병합 + CTR 계산"""
+                           visitor_df: pd.DataFrame,
+                           banner_gmv2_df: pd.DataFrame = None) -> pd.DataFrame:
+    """섹션별 클릭 합산 + 메타 병합 + CTR 계산 + 섹션 단위 GMV2 (배너 GMV2 합산)"""
     if not sec_click_df.empty and "section_uuid" in sec_click_df.columns:
         agg = (
             sec_click_df.groupby("section_uuid")
@@ -464,12 +496,33 @@ def build_section_summary(sections_df: pd.DataFrame, sec_click_df: pd.DataFrame,
         result["CTR(%)"] = (result["clicks"] / total_visitors * 100).round(3)
     else:
         result["CTR(%)"] = 0.0
+
+    # ── 섹션 단위 GMV2 = 그 섹션 안 모든 배너의 last-touch GMV2 합
+    if banner_gmv2_df is not None and not banner_gmv2_df.empty:
+        sec_gmv2 = (
+            banner_gmv2_df.groupby("section_uuid")
+            .agg(
+                section_gmv2   = ("attributed_gmv2",   "sum"),
+                section_orders = ("attributed_orders", "sum"),
+            )
+            .reset_index()
+        )
+        sec_gmv2["section_uuid"] = sec_gmv2["section_uuid"].astype(str)
+        result["section_uuid"] = result["section_uuid"].astype(str)
+        result = result.merge(sec_gmv2, on="section_uuid", how="left")
+    else:
+        result["section_gmv2"]   = 0.0
+        result["section_orders"] = 0
+
+    result["section_gmv2"]   = result["section_gmv2"].fillna(0).astype(float)
+    result["section_orders"] = result["section_orders"].fillna(0).astype(int)
     return result
 
 
 def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
-                          visitor_df: pd.DataFrame) -> pd.DataFrame:
-    """배너(위치 기반) 클릭 합산 + 메타 병합 + CTR 계산"""
+                          visitor_df: pd.DataFrame,
+                          banner_gmv2_df: pd.DataFrame = None) -> pd.DataFrame:
+    """배너(위치 기반) 클릭 합산 + 메타 병합 + CTR 계산 + last-touch GMV2 병합"""
     if not banner_pos_df.empty and "section_uuid" in banner_pos_df.columns:
         agg = (
             banner_pos_df.groupby(["section_uuid", "banner_idx"])
@@ -496,6 +549,26 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
         result["CTR(%)"] = (result["clicks"] / total_visitors * 100).round(4)
     else:
         result["CTR(%)"] = 0.0
+
+    # ── Last-touch GMV2 병합
+    if banner_gmv2_df is not None and not banner_gmv2_df.empty:
+        gmv2 = banner_gmv2_df.copy()
+        gmv2["section_uuid"] = gmv2["section_uuid"].astype(str)
+        gmv2["banner_idx"]   = gmv2["banner_idx"].astype(str)
+        result = result.merge(
+            gmv2[["section_uuid", "banner_idx",
+                  "attributed_gmv2", "attributed_orders", "attributed_users"]],
+            on=["section_uuid", "banner_idx"], how="left",
+        )
+        result = result.rename(columns={"attributed_users": "gmv2_users"})
+    else:
+        result["attributed_gmv2"]   = 0.0
+        result["attributed_orders"] = 0
+        result["gmv2_users"]        = 0
+
+    result["attributed_gmv2"]   = result["attributed_gmv2"].fillna(0).astype(float)
+    result["attributed_orders"] = result["attributed_orders"].fillna(0).astype(int)
+    result["gmv2_users"]        = result["gmv2_users"].fillna(0).astype(int)
     return result
 
 
@@ -605,12 +678,24 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
     sec_clicks_total = int(sec_row.get("clicks", 0) or 0)
     sec_users = int(sec_row.get("unique_users", 0) or 0)
     sec_ctr = float(sec_row.get("CTR(%)", 0) or 0)
+    sec_gmv2 = float(sec_row.get("section_gmv2", 0) or 0)
+    sec_orders = int(sec_row.get("section_orders", 0) or 0)
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("섹션명", sec_row.get("memo", "—") or "—")
     m2.metric("섹션 총 클릭", f"{sec_clicks_total:,}")
     m3.metric("섹션 순 클릭자", f"{sec_users:,}")
     m4.metric("섹션 CTR", f"{sec_ctr:.2f}%")
+    if sec_gmv2 > 0:
+        gmv2_label = f"{int(round(sec_gmv2)):,}원"
+    else:
+        gmv2_label = "—"
+    m5.metric(
+        "섹션 GMV2 (7일)",
+        gmv2_label,
+        delta=f"{sec_orders:,}건 결제" if sec_orders else None,
+        delta_color="off",
+    )
 
     st.caption(
         f"섹션 ID: `{sec_row['section_id']}` | "
@@ -624,9 +709,12 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
     ].copy()
 
     # 정렬 옵션
+    sort_options = ["노출 순서", "클릭 많은 순", "CTR 높은 순"]
+    if "attributed_gmv2" in sec_banners.columns:
+        sort_options.append("GMV2 높은 순")
     sort_by = st.radio(
         "정렬 기준",
-        ["노출 순서", "클릭 많은 순", "CTR 높은 순"],
+        sort_options,
         horizontal=True,
         key=f"banner_sort_{sel_uuid}",
     )
@@ -634,6 +722,8 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
         sec_banners = sec_banners.sort_values("clicks", ascending=False)
     elif sort_by == "CTR 높은 순" and "CTR(%)" in sec_banners.columns:
         sec_banners = sec_banners.sort_values("CTR(%)", ascending=False)
+    elif sort_by == "GMV2 높은 순" and "attributed_gmv2" in sec_banners.columns:
+        sec_banners = sec_banners.sort_values("attributed_gmv2", ascending=False)
     else:  # 노출 순서
         if "banner_orderIndex" in sec_banners.columns:
             sec_banners["_order"] = pd.to_numeric(sec_banners["banner_orderIndex"], errors="coerce").fillna(999)
@@ -656,7 +746,22 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
         if sec_clicks_total > 0 else 0.0
     )
 
-    show_cols = ["순서", "썸네일", "배너명", "clicks", "unique_users", "CTR(%)", "섹션 내 비중(%)", "링크"]
+    # last-touch GMV2 표시용 포맷 (만원 단위로 보기 좋게, 0이면 '—')
+    if "attributed_gmv2" in sec_banners_disp.columns:
+        def _fmt_gmv2(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return "—"
+            if v <= 0:
+                return "—"
+            return f"{int(round(v)):,}원"
+        sec_banners_disp["GMV2 (7일)"] = sec_banners_disp["attributed_gmv2"].apply(_fmt_gmv2)
+    if "attributed_orders" in sec_banners_disp.columns:
+        sec_banners_disp["주문 수"] = sec_banners_disp["attributed_orders"].fillna(0).astype(int)
+
+    show_cols = ["순서", "썸네일", "배너명", "clicks", "unique_users", "CTR(%)",
+                 "섹션 내 비중(%)", "GMV2 (7일)", "주문 수", "링크"]
     avail_cols = [c for c in show_cols if c in sec_banners_disp.columns]
     rename_d = {"clicks": "클릭 수", "unique_users": "순 클릭자", "CTR(%)": "CTR (%)"}
     final_table = sec_banners_disp[avail_cols].copy()
@@ -745,7 +850,7 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
 
 
 def render_section_perf_table(sec_summary):
-    """섹션별 성과 표"""
+    """섹션별 성과 표 (last-touch GMV2 포함)"""
     st.subheader("섹션별 성과")
     col_map = {
         "section_id": "섹션 ID",
@@ -757,14 +862,27 @@ def render_section_perf_table(sec_summary):
         "clicks": "클릭 수",
         "unique_users": "순 클릭자",
         "CTR(%)": "CTR (%)",
+        "section_gmv2": "GMV2 (7일, 원)",
+        "section_orders": "결제 건수 (7일)",
     }
     avail = [c for c in col_map if c in sec_summary.columns]
     show_df = sec_summary[avail].copy()
     show_df.columns = [col_map[c] for c in avail]
+    if "GMV2 (7일, 원)" in show_df.columns:
+        show_df["GMV2 (7일, 원)"] = show_df["GMV2 (7일, 원)"].fillna(0).astype(int)
+    if "결제 건수 (7일)" in show_df.columns:
+        show_df["결제 건수 (7일)"] = show_df["결제 건수 (7일)"].fillna(0).astype(int)
+    sort_col = "GMV2 (7일, 원)" if "GMV2 (7일, 원)" in show_df.columns else "클릭 수"
     st.dataframe(
-        show_df.sort_values("클릭 수", ascending=False),
+        show_df.sort_values(sort_col, ascending=False),
         use_container_width=True,
         hide_index=True,
+    )
+    st.caption(
+        "💡 GMV2는 **last-touch 어트리뷰션**: "
+        "각 결제마다 결제 직전 7일 이내 마지막으로 클릭한 배너 1개에 매출 100% 귀속. "
+        "할인·쿠폰·포인트 차감 후 실결제액, 교환·반품·취소 제외. "
+        "**비로그인 사용자 클릭은 매출 매칭 불가** (channel_hash 없음)."
     )
 
 
@@ -956,15 +1074,24 @@ def render_dashboard(page_config: dict):
     if src == "demo":
         st.caption("※ 아래 수치는 실제 데이터가 아닌 예시입니다.")
 
-    sec_click_df   = raw.get("section_clicks",   pd.DataFrame())
-    banner_pos_df  = raw.get("banner_pos_clicks", pd.DataFrame())
-    visitor_df     = raw.get("home_visitors",     pd.DataFrame())
+    sec_click_df    = raw.get("section_clicks",    pd.DataFrame())
+    banner_pos_df   = raw.get("banner_pos_clicks", pd.DataFrame())
+    visitor_df      = raw.get("home_visitors",     pd.DataFrame())
+    banner_gmv2_df  = raw.get("banner_gmv2",       pd.DataFrame())
+    gmv2_error      = raw.get("gmv2_error")
+
+    # GMV2 호출은 실패해도 본 대시보드는 보여줘야 하므로 별도 안내
+    if gmv2_error:
+        st.warning(
+            f"Last-touch GMV2 데이터 로드 실패 — 다른 수치는 정상 표시됩니다.  \n`{gmv2_error}`",
+            icon="⚠️",
+        )
 
     # ──────────────────────────────
     # 집계
     # ──────────────────────────────
-    sec_summary    = build_section_summary(sections_df, sec_click_df, visitor_df)
-    banner_summary = build_banner_summary(banners_df, banner_pos_df, visitor_df)
+    sec_summary    = build_section_summary(sections_df, sec_click_df, visitor_df, banner_gmv2_df)
+    banner_summary = build_banner_summary(banners_df, banner_pos_df, visitor_df, banner_gmv2_df)
 
     # 섹션 labels (재사용)
     section_labels = sec_summary.apply(
@@ -1083,7 +1210,11 @@ def render_dashboard(page_config: dict):
                     f"- **클릭**: `click_content` 이벤트, {click_note} 조건으로 집계\n"
                     f"- **CTR**: 클릭 ÷ 페이지 방문자 ({visit_note})\n"
                     "- **배너**: 섹션 내 배너 순서(0번째, 1번째 ...)로 구분 (배너별 UUID 클릭 미수집)\n"
-                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (KST 일자 기준)"
+                    "- **GMV2 (7일)**: last-touch 어트리뷰션 — 각 결제마다 결제 직전 7일 이내 "
+                    "마지막으로 클릭한 배너 1개에 매출 100% 귀속. 할인·쿠폰·포인트 차감 후 실결제액, "
+                    "교환·반품·취소 제외. 비로그인 사용자 클릭은 매출 매칭 불가\n"
+                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭, KST), "
+                    "MySQL `orders_orderitem` (결제, UTC→KST 변환)"
                 )
 
     # ════════════════════════════════════════════

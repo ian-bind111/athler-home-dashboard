@@ -283,3 +283,178 @@ ORDER BY 2 DESC
 LIMIT 200
     """
     return run_query(sql)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Last-touch GMV2 어트리뷰션 (클릭 후 7일 이내 결제)
+#
+# 로직:
+#   1) Athena: 기간 내 배너 클릭 이벤트(distinct_id, section_uuid, banner_idx, click_time)
+#   2) MySQL : 클릭일 ~ 클릭일+7일 이내 결제(channel_hash, ordered_at, payment_amount)
+#   3) Python: 각 결제 → 결제 직전 7일 내 마지막 클릭 1개에 GMV2 100% 귀속 (last-touch)
+#
+# GMV2 정의: 할인·쿠폰·포인트 차감 후 실결제액. 교환·반품·취소·미결제 제외.
+# 매핑 키: Athena distinct_id == MySQL users_user.channel_hash (로그인 사용자만)
+# ──────────────────────────────────────────────────────────────────
+
+MYSQL_DATA_SOURCE_ID = 1  # Athler MySQL
+
+
+def get_banner_clicks_for_attribution(start_date: date, end_date: date,
+                                        page_name: str = "home") -> pd.DataFrame:
+    """
+    Athena: 기간 내 홈/아울렛 배너 클릭 이벤트 raw 추출 (last-touch 매칭용)
+    반환 컬럼: distinct_id, section_uuid, banner_idx, click_time (Unix timestamp)
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    distinct_id,
+    element_uuid        AS section_uuid,
+    CAST(idx AS BIGINT) AS banner_idx,
+    time                AS click_time
+FROM {TABLE}
+WHERE {date_filter}
+  AND event = 'click_content'
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+  AND idx IS NOT NULL
+  AND distinct_id IS NOT NULL
+  AND distinct_id <> ''
+ORDER BY distinct_id, time
+LIMIT 200000
+    """
+    return run_query(sql, data_source_id=ATHENA_DATA_SOURCE_ID)
+
+
+def get_purchases_for_attribution(start_date: date, end_date: date,
+                                    attribution_window_days: int = 7) -> pd.DataFrame:
+    """
+    MySQL: 교환·반품·취소 제외 GMV2 + channel_hash 추출
+    구매 윈도우는 클릭 시작일 ~ 클릭 종료일+7일까지로 확장 (클릭 후 7일 내 구매 포착)
+    반환 컬럼: user_id, channel_hash, ordered_at, order_item_id, payment_amount
+    """
+    purchase_start = start_date.strftime("%Y-%m-%d")
+    purchase_end   = (end_date + timedelta(days=attribution_window_days)).strftime("%Y-%m-%d")
+
+    sql = f"""
+SELECT
+    o.user_id,
+    u.channel_hash,
+    o.ordered_at,
+    oi.id            AS order_item_id,
+    oi.payment_amount
+FROM orders_orderitem oi
+JOIN orders_order o
+  ON oi.order_id = o.id
+JOIN users_user u
+  ON o.user_id = u.id
+WHERE o.ordered_at BETWEEN '{purchase_start} 00:00:00'
+                       AND '{purchase_end} 23:59:59'
+  AND oi.status NOT IN (
+      'CANCELED',
+      'CANCEL_REQUESTED',
+      'REFUND_APPROVED',
+      'REFUNDED',
+      'PENDING_PAYMENT',
+      'EXCHANGE_APPROVED',
+      'EXCHANGE_CONFIRMED'
+  )
+  AND oi.is_exchange = 0
+  AND u.channel_hash IS NOT NULL
+  AND u.channel_hash <> ''
+ORDER BY o.ordered_at
+LIMIT 200000
+    """
+    return run_query(sql, data_source_id=MYSQL_DATA_SOURCE_ID)
+
+
+def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
+                                     purchases_df: pd.DataFrame,
+                                     attribution_window_days: int = 7) -> pd.DataFrame:
+    """
+    Last-touch 어트리뷰션 매칭:
+      각 결제(order_item)마다 결제 직전 N일(=7) 이내 마지막으로 클릭한 배너에 GMV2 100% 귀속.
+
+    clicks_df    : distinct_id, section_uuid, banner_idx, click_time (Unix sec)
+    purchases_df : user_id, channel_hash, ordered_at, order_item_id, payment_amount
+
+    반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
+    """
+    empty_cols = ["section_uuid", "banner_idx",
+                  "attributed_gmv2", "attributed_orders", "attributed_users"]
+    if clicks_df is None or clicks_df.empty or purchases_df is None or purchases_df.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    clicks = clicks_df.copy()
+    clicks["click_time"]  = pd.to_numeric(clicks["click_time"], errors="coerce")
+    clicks = clicks.dropna(subset=["click_time"])
+    clicks["click_dt"]    = pd.to_datetime(clicks["click_time"], unit="s", utc=True)
+    clicks["distinct_id"] = clicks["distinct_id"].astype(str).str.strip()
+    clicks["banner_idx"]  = clicks["banner_idx"].astype(str)
+
+    purchases = purchases_df.copy()
+    purchases["ordered_at"]   = pd.to_datetime(purchases["ordered_at"], utc=True, errors="coerce")
+    purchases = purchases.dropna(subset=["ordered_at"])
+    purchases["channel_hash"] = purchases["channel_hash"].astype(str).str.strip()
+    purchases["payment_amount"] = pd.to_numeric(
+        purchases["payment_amount"], errors="coerce"
+    ).fillna(0)
+
+    window = pd.Timedelta(days=attribution_window_days)
+
+    # distinct_id → 클릭 묶음 (시간순 정렬)
+    clicks_by_user = {
+        did: grp.sort_values("click_dt")
+        for did, grp in clicks.groupby("distinct_id")
+    }
+
+    results = []
+    for _, p in purchases.iterrows():
+        ch = p["channel_hash"]
+        if ch not in clicks_by_user:
+            continue
+        order_time = p["ordered_at"]
+        user_clicks = clicks_by_user[ch]
+        candidates = user_clicks[
+            (user_clicks["click_dt"] <= order_time)
+            & (order_time - user_clicks["click_dt"] <= window)
+        ]
+        if candidates.empty:
+            continue
+        last = candidates.iloc[-1]  # 정렬되어 있으므로 마지막이 최신 클릭
+        results.append({
+            "section_uuid":  last["section_uuid"],
+            "banner_idx":    last["banner_idx"],
+            "gmv2":          float(p["payment_amount"]),
+            "user_id":       p["user_id"],
+            "order_item_id": p["order_item_id"],
+        })
+
+    if not results:
+        return pd.DataFrame(columns=empty_cols)
+
+    attr = pd.DataFrame(results)
+    summary = (
+        attr.groupby(["section_uuid", "banner_idx"])
+        .agg(
+            attributed_gmv2   = ("gmv2",          "sum"),
+            attributed_orders = ("order_item_id", "count"),
+            attributed_users  = ("user_id",       "nunique"),
+        )
+        .reset_index()
+        .sort_values("attributed_gmv2", ascending=False)
+    )
+    return summary
+
+
+def get_banner_last_touch_gmv2(start_date: date, end_date: date,
+                                 page_name: str = "home",
+                                 attribution_window_days: int = 7) -> pd.DataFrame:
+    """
+    통합 진입점: Athena 클릭 + MySQL 구매를 받아 배너별 last-touch GMV2 반환.
+    반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
+    """
+    clicks_df    = get_banner_clicks_for_attribution(start_date, end_date, page_name)
+    purchases_df = get_purchases_for_attribution(start_date, end_date, attribution_window_days)
+    return compute_banner_last_touch_gmv2(clicks_df, purchases_df, attribution_window_days)
