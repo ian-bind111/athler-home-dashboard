@@ -304,12 +304,14 @@ def get_banner_clicks_for_attribution(start_date: date, end_date: date,
                                         page_name: str = "home") -> pd.DataFrame:
     """
     Athena: 기간 내 홈/아울렛 배너 클릭 이벤트 raw 추출 (last-touch 매칭용)
-    반환 컬럼: distinct_id, section_uuid, banner_idx, click_time (Unix timestamp)
+    user_id로 MySQL users_user.id와 직접 매칭. 비로그인 사용자(user_id 없음)는 제외.
+
+    반환 컬럼: user_id, section_uuid, banner_idx, click_time (Unix timestamp, 초)
     """
     date_filter = _date_conditions(start_date, end_date)
     sql = f"""
 SELECT
-    distinct_id,
+    user_id,
     element_uuid        AS section_uuid,
     CAST(idx AS BIGINT) AS banner_idx,
     time                AS click_time
@@ -319,9 +321,9 @@ WHERE {date_filter}
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
   AND idx IS NOT NULL
-  AND distinct_id IS NOT NULL
-  AND distinct_id <> ''
-ORDER BY distinct_id, time
+  AND user_id IS NOT NULL
+  AND user_id <> ''
+ORDER BY user_id, time
 LIMIT 200000
     """
     return run_query(sql, data_source_id=ATHENA_DATA_SOURCE_ID)
@@ -330,13 +332,13 @@ LIMIT 200000
 def get_purchases_for_attribution(start_date: date, end_date: date,
                                     attribution_window_days: int = 7) -> pd.DataFrame:
     """
-    MySQL: 교환·반품·취소 제외 GMV2 + channel_hash 추출
+    MySQL: 교환·반품·취소 제외 GMV2 + user_id 추출
     구매 윈도우는 클릭 시작일 ~ 클릭 종료일+7일까지로 확장 (클릭 후 7일 내 구매 포착)
 
-    timezone 안전성을 위해 ordered_at을 명시적으로 Unix timestamp로 변환해서 받음.
-    Athena의 click_time(Unix UTC)과 직접 비교 가능.
+    Athena 이벤트 로그의 user_id와 동일 키이므로 users_user JOIN 불필요.
+    timezone 혼란 방지를 위해 UNIX_TIMESTAMP로 직접 받아 Athena click_time과 정수 비교.
 
-    반환 컬럼: user_id, channel_hash, ordered_at_ts (Unix sec), order_item_id, payment_amount
+    반환 컬럼: user_id, ordered_at_ts (Unix sec), order_item_id, payment_amount
     """
     purchase_start = start_date.strftime("%Y-%m-%d")
     purchase_end   = (end_date + timedelta(days=attribution_window_days)).strftime("%Y-%m-%d")
@@ -344,15 +346,12 @@ def get_purchases_for_attribution(start_date: date, end_date: date,
     sql = f"""
 SELECT
     o.user_id,
-    u.channel_hash,
     UNIX_TIMESTAMP(o.ordered_at) AS ordered_at_ts,
     oi.id                        AS order_item_id,
     oi.payment_amount
 FROM orders_orderitem oi
 JOIN orders_order o
   ON oi.order_id = o.id
-JOIN users_user u
-  ON o.user_id = u.id
 WHERE o.ordered_at BETWEEN '{purchase_start} 00:00:00'
                        AND '{purchase_end} 23:59:59'
   AND oi.status NOT IN (
@@ -365,8 +364,7 @@ WHERE o.ordered_at BETWEEN '{purchase_start} 00:00:00'
       'EXCHANGE_CONFIRMED'
   )
   AND oi.is_exchange = 0
-  AND u.channel_hash IS NOT NULL
-  AND u.channel_hash <> ''
+  AND o.user_id IS NOT NULL
 ORDER BY o.ordered_at
 LIMIT 200000
     """
@@ -380,9 +378,11 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
     Last-touch 어트리뷰션 매칭:
       각 결제(order_item)마다 결제 직전 N일(=7) 이내 마지막으로 클릭한 배너에 GMV2 100% 귀속.
 
+    매칭 키: user_id (Athena event log의 user_id == MySQL users_user.id)
     timezone 혼란 방지를 위해 둘 다 Unix timestamp(초) 정수로 직접 비교.
-    clicks_df    : distinct_id, section_uuid, banner_idx, click_time (Unix sec)
-    purchases_df : user_id, channel_hash, ordered_at_ts (Unix sec), order_item_id, payment_amount
+
+    clicks_df    : user_id, section_uuid, banner_idx, click_time (Unix sec)
+    purchases_df : user_id, ordered_at_ts (Unix sec), order_item_id, payment_amount
 
     반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
     """
@@ -392,13 +392,13 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
         return pd.DataFrame(columns=empty_cols)
 
     clicks = clicks_df.copy()
-    clicks["click_time"]  = pd.to_numeric(clicks["click_time"], errors="coerce")
+    clicks["click_time"] = pd.to_numeric(clicks["click_time"], errors="coerce")
     clicks = clicks.dropna(subset=["click_time"])
-    clicks["distinct_id"] = clicks["distinct_id"].astype(str).str.strip()
-    clicks["banner_idx"]  = clicks["banner_idx"].astype(str)
+    clicks["user_id"]    = clicks["user_id"].astype(str).str.strip()
+    clicks["banner_idx"] = clicks["banner_idx"].astype(str)
+    clicks = clicks[clicks["user_id"] != ""]
 
     purchases = purchases_df.copy()
-    # ordered_at_ts(우선) 또는 ordered_at(폴백) 양쪽 호환
     if "ordered_at_ts" in purchases.columns:
         purchases["ordered_ts"] = pd.to_numeric(purchases["ordered_at_ts"], errors="coerce")
     else:
@@ -410,26 +410,26 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
             pass
         purchases["ordered_ts"] = ordered_dt.astype("int64") // 10**9
     purchases = purchases.dropna(subset=["ordered_ts"])
-    purchases["channel_hash"]   = purchases["channel_hash"].astype(str).str.strip()
+    purchases["user_id"]        = purchases["user_id"].astype(str).str.strip()
     purchases["payment_amount"] = pd.to_numeric(
         purchases["payment_amount"], errors="coerce"
     ).fillna(0)
 
     window_seconds = attribution_window_days * 86400  # 7일 = 604800초
 
-    # distinct_id → 클릭 묶음 (시간순 정렬, Unix timestamp 그대로)
+    # user_id → 클릭 묶음 (시간순 정렬, Unix timestamp 그대로)
     clicks_by_user = {
-        did: grp.sort_values("click_time")
-        for did, grp in clicks.groupby("distinct_id")
+        uid: grp.sort_values("click_time")
+        for uid, grp in clicks.groupby("user_id")
     }
 
     results = []
     for _, p in purchases.iterrows():
-        ch = p["channel_hash"]
-        if ch not in clicks_by_user:
+        uid = p["user_id"]
+        if uid not in clicks_by_user:
             continue
         order_ts = float(p["ordered_ts"])
-        user_clicks = clicks_by_user[ch]
+        user_clicks = clicks_by_user[uid]
         # candidates: 결제 시각 이전 + 7일 이내
         diff = order_ts - user_clicks["click_time"]
         mask = (diff >= 0) & (diff <= window_seconds)
@@ -441,7 +441,7 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
             "section_uuid":  last["section_uuid"],
             "banner_idx":    last["banner_idx"],
             "gmv2":          float(p["payment_amount"]),
-            "user_id":       p["user_id"],
+            "user_id":       uid,
             "order_item_id": p["order_item_id"],
         })
 
