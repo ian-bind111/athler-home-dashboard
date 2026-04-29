@@ -622,9 +622,22 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
     sec_banners = banner_summary[
         banner_summary["section_uuid"].astype(str) == sel_uuid
     ].copy()
-    if "banner_orderIndex" in sec_banners.columns:
-        sec_banners["_order"] = pd.to_numeric(sec_banners["banner_orderIndex"], errors="coerce").fillna(999)
-        sec_banners = sec_banners.sort_values("_order").drop(columns=["_order"])
+
+    # 정렬 옵션
+    sort_by = st.radio(
+        "정렬 기준",
+        ["노출 순서", "클릭 많은 순", "CTR 높은 순"],
+        horizontal=True,
+        key=f"banner_sort_{sel_uuid}",
+    )
+    if sort_by == "클릭 많은 순":
+        sec_banners = sec_banners.sort_values("clicks", ascending=False)
+    elif sort_by == "CTR 높은 순" and "CTR(%)" in sec_banners.columns:
+        sec_banners = sec_banners.sort_values("CTR(%)", ascending=False)
+    else:  # 노출 순서
+        if "banner_orderIndex" in sec_banners.columns:
+            sec_banners["_order"] = pd.to_numeric(sec_banners["banner_orderIndex"], errors="coerce").fillna(999)
+            sec_banners = sec_banners.sort_values("_order").drop(columns=["_order"])
 
     sec_banners_disp = sec_banners.copy()
     sec_banners_disp["썸네일"] = sec_banners_disp["imageUrl"].apply(img_html) if "imageUrl" in sec_banners_disp.columns else "—"
@@ -649,7 +662,7 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
     final_table = sec_banners_disp[avail_cols].copy()
     final_table.columns = [rename_d.get(c, c) for c in final_table.columns]
 
-    st.markdown(f"**섹션 내 배너 ({len(sec_banners_disp)}개) — 노출 순서**")
+    st.markdown(f"**섹션 내 배너 ({len(sec_banners_disp)}개) — {sort_by}**")
     st.write(
         final_table.to_html(escape=False, index=False, table_id="sec-banner-table"),
         unsafe_allow_html=True,
