@@ -48,8 +48,8 @@ PAGE_HOME = {
     "icon": "📊",
     "page_uuid": "486908c0-908d-4359-8e2c-419ce14cd0d7",
     "page_name": "home",
-    "view_event": "view_home",
-    "view_page_name": None,  # view_event 직접 사용
+    "view_event": "content_impressed",   # 아울렛과 동일 기준으로 집계 통일
+    "view_page_name": "home",            # page_name='home' 필터 추가
     "sections_csv": "data/sections.csv",
     "banners_csv": "data/banners.csv",
     "page_url": "https://athler.kr/home",
