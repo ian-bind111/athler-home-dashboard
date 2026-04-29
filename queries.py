@@ -332,7 +332,11 @@ def get_purchases_for_attribution(start_date: date, end_date: date,
     """
     MySQL: 교환·반품·취소 제외 GMV2 + channel_hash 추출
     구매 윈도우는 클릭 시작일 ~ 클릭 종료일+7일까지로 확장 (클릭 후 7일 내 구매 포착)
-    반환 컬럼: user_id, channel_hash, ordered_at, order_item_id, payment_amount
+
+    timezone 안전성을 위해 ordered_at을 명시적으로 Unix timestamp로 변환해서 받음.
+    Athena의 click_time(Unix UTC)과 직접 비교 가능.
+
+    반환 컬럼: user_id, channel_hash, ordered_at_ts (Unix sec), order_item_id, payment_amount
     """
     purchase_start = start_date.strftime("%Y-%m-%d")
     purchase_end   = (end_date + timedelta(days=attribution_window_days)).strftime("%Y-%m-%d")
@@ -341,8 +345,8 @@ def get_purchases_for_attribution(start_date: date, end_date: date,
 SELECT
     o.user_id,
     u.channel_hash,
-    o.ordered_at,
-    oi.id            AS order_item_id,
+    UNIX_TIMESTAMP(o.ordered_at) AS ordered_at_ts,
+    oi.id                        AS order_item_id,
     oi.payment_amount
 FROM orders_orderitem oi
 JOIN orders_order o
@@ -376,8 +380,9 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
     Last-touch 어트리뷰션 매칭:
       각 결제(order_item)마다 결제 직전 N일(=7) 이내 마지막으로 클릭한 배너에 GMV2 100% 귀속.
 
+    timezone 혼란 방지를 위해 둘 다 Unix timestamp(초) 정수로 직접 비교.
     clicks_df    : distinct_id, section_uuid, banner_idx, click_time (Unix sec)
-    purchases_df : user_id, channel_hash, ordered_at, order_item_id, payment_amount
+    purchases_df : user_id, channel_hash, ordered_at_ts (Unix sec), order_item_id, payment_amount
 
     반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
     """
@@ -389,23 +394,32 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
     clicks = clicks_df.copy()
     clicks["click_time"]  = pd.to_numeric(clicks["click_time"], errors="coerce")
     clicks = clicks.dropna(subset=["click_time"])
-    clicks["click_dt"]    = pd.to_datetime(clicks["click_time"], unit="s", utc=True)
     clicks["distinct_id"] = clicks["distinct_id"].astype(str).str.strip()
     clicks["banner_idx"]  = clicks["banner_idx"].astype(str)
 
     purchases = purchases_df.copy()
-    purchases["ordered_at"]   = pd.to_datetime(purchases["ordered_at"], utc=True, errors="coerce")
-    purchases = purchases.dropna(subset=["ordered_at"])
-    purchases["channel_hash"] = purchases["channel_hash"].astype(str).str.strip()
+    # ordered_at_ts(우선) 또는 ordered_at(폴백) 양쪽 호환
+    if "ordered_at_ts" in purchases.columns:
+        purchases["ordered_ts"] = pd.to_numeric(purchases["ordered_at_ts"], errors="coerce")
+    else:
+        # 폴백: ordered_at 문자열을 KST로 가정하고 Unix sec으로 변환
+        ordered_dt = pd.to_datetime(purchases.get("ordered_at"), errors="coerce")
+        try:
+            ordered_dt = ordered_dt.dt.tz_localize("Asia/Seoul")
+        except (TypeError, AttributeError):
+            pass
+        purchases["ordered_ts"] = ordered_dt.astype("int64") // 10**9
+    purchases = purchases.dropna(subset=["ordered_ts"])
+    purchases["channel_hash"]   = purchases["channel_hash"].astype(str).str.strip()
     purchases["payment_amount"] = pd.to_numeric(
         purchases["payment_amount"], errors="coerce"
     ).fillna(0)
 
-    window = pd.Timedelta(days=attribution_window_days)
+    window_seconds = attribution_window_days * 86400  # 7일 = 604800초
 
-    # distinct_id → 클릭 묶음 (시간순 정렬)
+    # distinct_id → 클릭 묶음 (시간순 정렬, Unix timestamp 그대로)
     clicks_by_user = {
-        did: grp.sort_values("click_dt")
+        did: grp.sort_values("click_time")
         for did, grp in clicks.groupby("distinct_id")
     }
 
@@ -414,15 +428,15 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
         ch = p["channel_hash"]
         if ch not in clicks_by_user:
             continue
-        order_time = p["ordered_at"]
+        order_ts = float(p["ordered_ts"])
         user_clicks = clicks_by_user[ch]
-        candidates = user_clicks[
-            (user_clicks["click_dt"] <= order_time)
-            & (order_time - user_clicks["click_dt"] <= window)
-        ]
+        # candidates: 결제 시각 이전 + 7일 이내
+        diff = order_ts - user_clicks["click_time"]
+        mask = (diff >= 0) & (diff <= window_seconds)
+        candidates = user_clicks[mask]
         if candidates.empty:
             continue
-        last = candidates.iloc[-1]  # 정렬되어 있으므로 마지막이 최신 클릭
+        last = candidates.iloc[-1]  # sort_values("click_time") 했으므로 마지막이 최신
         results.append({
             "section_uuid":  last["section_uuid"],
             "banner_idx":    last["banner_idx"],
