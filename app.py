@@ -1371,11 +1371,11 @@ def render_dashboard(page_config: dict):
         # 메타 새로고침 버튼: athler.kr 페이지를 다시 긁어 섹션명/배너 정보 갱신
         if st.button(
             "🔄 메타 새로고침",
-            help=f"{page_config['page_url']} 페이지에서 섹션명/배너 이미지/링크를 다시 가져옵니다 (1~2분 소요).",
+            help=f"{page_config['page_url']} 페이지의 섹션명/배너 이미지/링크를 athler.co.kr API에서 다시 가져옵니다 (~10초).",
             key=f"refresh_meta_{page_key}",
             use_container_width=True,
         ):
-            with st.spinner("athler 페이지에서 최신 정보를 가져오는 중... (1~2분)"):
+            with st.spinner("athler API에서 최신 정보를 가져오는 중..."):
                 try:
                     import json as _json
                     import subprocess
@@ -1388,17 +1388,17 @@ def render_dashboard(page_config: dict):
                         BASE_DIR, "data",
                         os.path.basename(page_config["banners_csv"]),
                     )
-                    # Streamlit asyncio 루프와 Playwright sync API 충돌 회피 위해 subprocess 사용
+                    # athler.co.kr API 직접 호출 (requests 기반, Cloud에서도 작동)
                     proc = subprocess.run(
                         [
                             _sys.executable,
                             os.path.join(BASE_DIR, "meta_refresh.py"),
-                            page_config["page_url"],
+                            page_config["page_name"],   # 'home' 또는 'outlet'
                             sections_path,
                             banners_path,
                         ],
                         capture_output=True, text=True, encoding="utf-8",
-                        timeout=180,
+                        timeout=60,
                     )
                     last_line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else "{}"
                     try:

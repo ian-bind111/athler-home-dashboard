@@ -1,56 +1,60 @@
 # -*- coding: utf-8 -*-
 """
 athler.kr 페이지 메타 정보 (섹션 / 배너) 새로고침
-- Playwright로 페이지 열어 API 응답 가로채서 sections/banners CSV 갱신
+- athler.co.kr API를 직접 호출해서 sections/banners CSV 갱신
+- requests만 사용하므로 Streamlit Cloud에서도 작동 (Playwright 의존성 제거)
+
+API 엔드포인트:
+  https://athler.co.kr/api/v3/pages/{page_name}/temp
+  - page_name='home'    → 홈 영역
+  - page_name='outlet'  → 아울렛 영역
 """
 
 import csv
 from pathlib import Path
 from typing import Dict
 
+import requests
 
-def refresh_meta(page_url: str, sections_csv: str, banners_csv: str) -> Dict[str, int]:
+
+API_BASE = "https://athler.co.kr/api/v3/pages"
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def refresh_meta(page_name: str, sections_csv: str, banners_csv: str,
+                 timeout: int = 20) -> Dict[str, int]:
     """
-    athler.kr 페이지를 열어서 섹션/배너 메타 정보를 다시 추출하여 CSV 저장.
+    athler.co.kr 페이지 API를 호출하여 섹션/배너 메타 정보를 CSV로 저장.
+
+    Args:
+        page_name: 'home' 또는 'outlet'
+        sections_csv: 섹션 CSV 저장 경로
+        banners_csv: 배너 CSV 저장 경로
 
     Returns:
         {"section_count": N, "banner_count": M}
     """
-    from playwright.sync_api import sync_playwright
-
-    api_responses = []
-
-    def handle_response(response):
-        url = response.url
-        if "athler" not in url and "api" not in url.lower():
-            return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        try:
-            api_responses.append({"url": url, "body": response.json()})
-        except Exception:
-            pass
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
-        page = context.new_page()
-        page.on("response", handle_response)
-        page.goto(page_url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)
-        browser.close()
-
-    # 메인 페이지 구조 API 찾기 (/api/v3/pages/home/temp)
-    home = None
-    for r in api_responses:
-        if "/api/v3/pages/home/temp" in r["url"]:
-            home = r["body"]
-            break
-
-    if not home:
+    url = f"{API_BASE}/{page_name}/temp"
+    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+    if resp.status_code != 200:
         raise RuntimeError(
-            f"athler.kr 페이지({page_url})의 메인 API 응답(/api/v3/pages/home/temp)을 찾을 수 없습니다."
+            f"athler API 호출 실패 ({url}): HTTP {resp.status_code} — {resp.text[:200]}"
+        )
+    try:
+        home = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f"API 응답이 JSON이 아닙니다: {e}")
+
+    if not isinstance(home, dict) or "content" not in home:
+        raise RuntimeError(
+            f"예상한 응답 구조가 아닙니다 (content 필드 누락): {str(home)[:200]}"
         )
 
     # 섹션 / 배너 추출
@@ -109,7 +113,6 @@ def refresh_meta(page_url: str, sections_csv: str, banners_csv: str) -> Dict[str
 
 # ──────────────────────────────────────────────
 # CLI 진입점 (subprocess로 호출됨)
-# - Streamlit asyncio 루프와 충돌 회피용
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     import io
@@ -120,7 +123,7 @@ if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
     if len(sys.argv) < 4:
-        print(json.dumps({"error": "usage: meta_refresh.py <url> <sections_csv> <banners_csv>"}))
+        print(json.dumps({"error": "usage: meta_refresh.py <page_name> <sections_csv> <banners_csv>"}))
         sys.exit(1)
     try:
         out = refresh_meta(sys.argv[1], sys.argv[2], sys.argv[3])
