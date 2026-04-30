@@ -837,6 +837,12 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
         if sec_clicks_total > 0 else 0.0
     )
 
+    # 노출 컬럼 (build_banner_summary에서 병합된 impressions / unique_impressed)
+    if "impressions" in sec_banners_disp.columns:
+        sec_banners_disp["총 노출"] = sec_banners_disp["impressions"].fillna(0).astype(int)
+    if "unique_impressed" in sec_banners_disp.columns:
+        sec_banners_disp["순 노출자"] = sec_banners_disp["unique_impressed"].fillna(0).astype(int)
+
     # last-touch GMV2 표시용 포맷 (만원 단위로 보기 좋게, 0이면 '—')
     if "attributed_gmv2" in sec_banners_disp.columns:
         def _fmt_gmv2(v):
@@ -851,7 +857,8 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
     if "attributed_orders" in sec_banners_disp.columns:
         sec_banners_disp["주문 수"] = sec_banners_disp["attributed_orders"].fillna(0).astype(int)
 
-    show_cols = ["순서", "썸네일", "배너명", "clicks", "unique_users", "CTR(%)",
+    show_cols = ["순서", "썸네일", "배너명", "총 노출", "순 노출자",
+                 "clicks", "unique_users", "CTR(%)",
                  "섹션 내 비중(%)", "GMV2 (7일)", "주문 수", "링크"]
     avail_cols = [c for c in show_cols if c in sec_banners_disp.columns]
     rename_d = {"clicks": "클릭 수", "unique_users": "순 클릭자", "CTR(%)": "CTR (%)"}
