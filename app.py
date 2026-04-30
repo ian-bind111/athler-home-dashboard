@@ -978,16 +978,17 @@ def render_section_perf_table(sec_summary):
 
 
 # ──────────────────────────────────────────────
-# 9-2. 스크롤 뎁스 (idx별 노출 비율로 사용자 스크롤 깊이 측정)
+# 9-2a. 스와이프 뎁스 (섹션 안 배너 idx별 노출 비율 — 가로 스와이프 깊이)
 # ──────────────────────────────────────────────
-def render_scroll_depth(sec_summary, banner_summary, page_key="home"):
+def render_swipe_depth(sec_summary, banner_summary, page_key="home"):
     """
-    섹션별로 idx 1번(=banner_orderIndex 1) 노출을 100%로 두고,
-    뒤쪽 idx(2,3,...)의 상대 노출 비율을 보여줘서 사용자가 어디까지 스크롤/스와이프했는지 측정.
+    섹션 안에서 idx 1번(=banner_orderIndex 1) 노출을 100%로 두고,
+    뒤쪽 idx(2,3,...)의 상대 노출 비율을 보여줘서 사용자가 어디까지 스와이프했는지 측정.
+    (가로 스와이프 / 캐러셀 영역에 특히 의미 있음)
     """
-    st.subheader("📜 스크롤 뎁스 분석")
+    st.subheader("🔄 스와이프 뎁스 분석")
     st.caption(
-        "각 섹션의 **1번째 위치 노출**을 100%로 잡고, 뒤쪽 위치의 노출 비율을 보여드려요. "
+        "각 섹션의 **1번째 위치 노출**을 100%로 잡고, 같은 섹션 내 뒤쪽 위치의 노출 비율을 보여드려요. "
         "값이 가파르게 떨어지면 사용자가 그 지점부터 안 보고 이탈한다는 뜻이에요. "
         "(스와이프 캐러셀 / 가로 스크롤 영역에 특히 의미 있어요.)"
     )
@@ -1169,6 +1170,164 @@ def render_scroll_depth(sec_summary, banner_summary, page_key="home"):
         "캐러셀처럼 사용자가 직접 스와이프해야 하는 컴포넌트는 뒤쪽 위치 비율이 자연스럽게 떨어집니다. "
         "**50% 라인 아래로 떨어지는 위치 = 사용자 절반이 안 보는 콘텐츠.** "
         "이 위치 뒤로는 콘텐츠 우선순위를 재고하시면 좋아요."
+    )
+
+
+# ──────────────────────────────────────────────
+# 9-2b. 스크롤 뎁스 (섹션 단위 — 페이지 세로 스크롤 깊이)
+# ──────────────────────────────────────────────
+def render_scroll_depth(sec_summary, page_key="home"):
+    """
+    페이지 첫 섹션(orderIndex 가장 작은 섹션) 노출을 100%로 두고,
+    뒤쪽 섹션들의 노출 비율을 보여줘서 사용자가 페이지 어디까지 스크롤했는지 측정.
+    """
+    st.subheader("📜 스크롤 뎁스 분석 (섹션 단위)")
+    st.caption(
+        "페이지 **첫 섹션의 노출**을 100%로 잡고, 페이지 아래쪽 섹션들의 노출 비율을 보여드려요. "
+        "예: 홈 배너(1번 섹션) = 100% 기준, 핫브랜드(N번 섹션)가 60% → 절반 가까운 사용자가 그 섹션까지 안 내려옴. "
+        "**값이 떨어지는 지점 = 사용자가 페이지 이탈하는 구간.**"
+    )
+
+    if sec_summary is None or sec_summary.empty:
+        st.info("섹션 데이터가 없습니다.")
+        return
+    if "unique_impressed" not in sec_summary.columns:
+        st.info("노출 데이터가 로드되지 않았습니다.")
+        return
+
+    # orderIndex 순으로 정렬 (페이지 표시 순서)
+    df = sec_summary.copy()
+    if "orderIndex" in df.columns:
+        df["_order"] = pd.to_numeric(df["orderIndex"], errors="coerce")
+    else:
+        df["_order"] = range(len(df))
+    df = df.dropna(subset=["_order"]).sort_values("_order").reset_index(drop=True)
+
+    if df.empty:
+        st.info("orderIndex 정보가 있는 섹션이 없습니다.")
+        return
+
+    first_unique = float(df.iloc[0].get("unique_impressed", 0) or 0)
+    first_total  = float(df.iloc[0].get("impressions", 0) or 0)
+    if first_unique <= 0 and first_total <= 0:
+        st.info("첫 섹션의 노출 데이터가 없어 뎁스 계산이 불가합니다.")
+        return
+
+    # 뎁스 계산
+    df["섹션 순서"] = df["_order"].astype(int).astype(str) + "번"
+    df["섹션명"]    = df.get("memo", "—").fillna("(이름 없음)")
+    df["섹션명"]    = df["섹션명"].apply(lambda x: x if str(x).strip() else "(이름 없음)")
+    if first_unique > 0:
+        df["순노출 뎁스(%)"] = (df["unique_impressed"] / first_unique * 100).round(1)
+    else:
+        df["순노출 뎁스(%)"] = 0.0
+    if first_total > 0:
+        df["총노출 뎁스(%)"] = (df["impressions"] / first_total * 100).round(1)
+    else:
+        df["총노출 뎁스(%)"] = 0.0
+
+    # 핵심 KPI: 50% 이하로 떨어지는 첫 섹션
+    drop_50_idx = None
+    for i, row in df.iterrows():
+        if i == 0:
+            continue
+        if row["순노출 뎁스(%)"] < 50.0:
+            drop_50_idx = i
+            break
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("총 섹션 수", f"{len(df):,}")
+    k2.metric("1번 섹션 순 노출자", f"{int(first_unique):,}")
+    last_pct = float(df.iloc[-1]["순노출 뎁스(%)"]) if not df.empty else 0
+    k3.metric("마지막 섹션까지 뎁스", f"{last_pct:.1f}%",
+              delta=f"{int(df.iloc[-1].get('unique_impressed', 0) or 0):,}명",
+              delta_color="off")
+    if drop_50_idx is not None:
+        drop_row = df.iloc[drop_50_idx]
+        k4.metric(
+            "50% 이하 첫 섹션",
+            f"{int(drop_row['_order'])}번",
+            delta=str(drop_row['섹션명'])[:12],
+            delta_color="off",
+        )
+    else:
+        k4.metric("50% 이하 첫 섹션", "없음", delta="모든 섹션 50% 이상", delta_color="off")
+
+    st.markdown("---")
+    st.markdown("### 📈 페이지 스크롤 뎁스 곡선")
+
+    # 차트
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["섹션 순서"],
+        y=df["순노출 뎁스(%)"],
+        mode="lines+markers+text",
+        name="순 노출자 기준",
+        text=df["순노출 뎁스(%)"].astype(str) + "%",
+        textposition="top center",
+        line=dict(color="#3182F6", width=3),
+        marker=dict(size=10),
+        customdata=df[["섹션명", "unique_impressed"]],
+        hovertemplate=(
+            "<b>%{x} %{customdata[0]}</b><br>"
+            "뎁스: %{y}%<br>"
+            "순 노출자: %{customdata[1]:,}명"
+            "<extra></extra>"
+        ),
+    ))
+    if first_total > 0:
+        fig.add_trace(go.Scatter(
+            x=df["섹션 순서"],
+            y=df["총노출 뎁스(%)"],
+            mode="lines+markers",
+            name="총 노출 기준",
+            line=dict(color="#FF9F43", width=2, dash="dot"),
+            marker=dict(size=7),
+        ))
+    fig.add_hline(y=100, line_dash="dash", line_color="#888",
+                  annotation_text="1번 섹션 = 100%", annotation_position="top right")
+    fig.add_hline(y=50, line_dash="dot", line_color="#FF6B6B",
+                  annotation_text="50% 라인", annotation_position="bottom right")
+    fig.update_layout(
+        title="섹션 순서별 노출 뎁스 (페이지 위 → 아래)",
+        xaxis_title="섹션 순서 (페이지 표시 순)",
+        yaxis_title="노출 뎁스 (%)",
+        height=460,
+        margin=dict(l=0, r=0, t=50, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=-0.2),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 상세표
+    st.markdown("### 📋 섹션별 뎁스 상세")
+    show_cols = ["_order", "섹션명", "elementType", "uiType",
+                 "impressions", "unique_impressed", "순노출 뎁스(%)", "총노출 뎁스(%)",
+                 "clicks", "unique_users", "CTR(%)"]
+    avail = [c for c in show_cols if c in df.columns]
+    rename_map = {
+        "_order": "순서",
+        "elementType": "유형",
+        "uiType": "UI 타입",
+        "impressions": "총 노출",
+        "unique_impressed": "순 노출자",
+        "clicks": "클릭",
+        "unique_users": "순 클릭자",
+        "CTR(%)": "CTR (%)",
+    }
+    table_df = df[avail].copy()
+    table_df.columns = [rename_map.get(c, c) for c in table_df.columns]
+    if "순서" in table_df.columns:
+        table_df["순서"] = table_df["순서"].astype(int)
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "💡 **해석 가이드**: "
+        "이 분석은 페이지 **세로 스크롤 깊이**를 측정해요. "
+        "각 섹션이 화면에 노출되려면 사용자가 거기까지 스크롤해야 하므로, "
+        "뒤쪽 섹션의 노출 비율이 곧 '거기까지 도달한 사용자 비율'이에요. "
+        "**최상단 섹션부터 90% 이상 유지되다가 갑자기 떨어지는 지점이 페이지의 이탈 포인트**입니다. "
+        "그 위로는 콘텐츠 우선순위가 잘 잡힌 거고, 그 아래는 재배치를 고려해 보세요."
     )
 
 
@@ -1409,8 +1568,8 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 탭
     # ──────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["종합 요약", "섹션별 분석", "배너별 분석", "스크롤 뎁스", "상세 비교"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["종합 요약", "섹션별 분석", "배너별 분석", "스크롤 뎁스", "스와이프 뎁스", "상세 비교"]
     )
 
     # ════════════════════════════════════════════
@@ -1771,15 +1930,21 @@ def render_dashboard(page_config: dict):
             st.info("배너를 선택하거나 기간 데이터가 없습니다.")
 
     # ════════════════════════════════════════════
-    # TAB 4 — 스크롤 뎁스 (idx별 노출 비율)
+    # TAB 4 — 스크롤 뎁스 (섹션 단위, 페이지 세로 스크롤 깊이)
     # ════════════════════════════════════════════
     with tab4:
-        render_scroll_depth(sec_summary, banner_summary, page_key=page_key)
+        render_scroll_depth(sec_summary, page_key=page_key)
 
     # ════════════════════════════════════════════
-    # TAB 5 — 상세 비교
+    # TAB 5 — 스와이프 뎁스 (섹션 안 idx별, 가로 스와이프 깊이)
     # ════════════════════════════════════════════
     with tab5:
+        render_swipe_depth(sec_summary, banner_summary, page_key=page_key)
+
+    # ════════════════════════════════════════════
+    # TAB 6 — 상세 비교
+    # ════════════════════════════════════════════
+    with tab6:
         st.subheader("섹션 / 배너 상세 비교")
 
         comp_type = st.radio("비교 단위", ["섹션", "배너"], horizontal=True, key=f"comp_radio_{page_key}")
