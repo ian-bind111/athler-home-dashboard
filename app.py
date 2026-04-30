@@ -313,7 +313,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 # 3. 메타데이터 로드 (CSV)
 # ──────────────────────────────────────────────
 @st.cache_data(ttl=600)
-def load_sections(csv_filename: str) -> pd.DataFrame:
+def load_sections(csv_filename: str, _refresh_token: int = 0) -> pd.DataFrame:
+    """_refresh_token: 메타 새로고침 시 증가시켜 캐시를 강제 무효화 (인자만 변경)"""
     path = os.path.join(DATA_DIR, csv_filename.replace("data/", ""))
     df = pd.read_csv(path, encoding="utf-8")
     df.columns = df.columns.str.lstrip("﻿")  # BOM 제거
@@ -324,7 +325,8 @@ def load_sections(csv_filename: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_banners(csv_filename: str) -> pd.DataFrame:
+def load_banners(csv_filename: str, _refresh_token: int = 0) -> pd.DataFrame:
+    """_refresh_token: 메타 새로고침 시 증가시켜 캐시를 강제 무효화 (인자만 변경)"""
     path = os.path.join(DATA_DIR, csv_filename.replace("data/", ""))
     df = pd.read_csv(path, encoding="utf-8")
     df.columns = df.columns.str.lstrip("﻿")  # BOM 제거
@@ -334,6 +336,11 @@ def load_banners(csv_filename: str) -> pd.DataFrame:
     if "banner_orderIndex" in df.columns:
         df["banner_idx"] = (df["banner_orderIndex"].astype(float) - 1).astype(int).astype(str)
     return df
+
+
+def _meta_token() -> int:
+    """현재 세션의 메타 새로고침 토큰. 모든 페이지·탭이 공유해서 같이 무효화됨."""
+    return int(st.session_state.get("meta_refresh_token", 0))
 
 
 # ──────────────────────────────────────────────
@@ -1434,12 +1441,20 @@ def render_dashboard(page_config: dict):
                     if errors:
                         st.error("❌ 새로고침 실패\n\n" + "\n".join(errors))
                     if results:
+                        # 메타 토큰 증가 → 모든 페이지·탭의 load_sections/load_banners 캐시 무효화
+                        st.session_state["meta_refresh_token"] = (
+                            int(st.session_state.get("meta_refresh_token", 0)) + 1
+                        )
+                        # Redash 데이터 캐시도 비워서 새 메타 기준으로 모든 영역 재계산
                         st.cache_data.clear()
                         msg_lines = [
                             f"- **{p}**: 섹션 {s}개, 배너 {b}개"
                             for p, s, b in results
                         ]
-                        st.success("✅ 새로고침 완료\n\n" + "\n".join(msg_lines))
+                        st.success(
+                            "✅ 새로고침 완료 (홈/아울렛 모든 영역 적용됨)\n\n"
+                            + "\n".join(msg_lines)
+                        )
                         if not errors:
                             st.rerun()
                 except subprocess.TimeoutExpired:
@@ -1499,8 +1514,9 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 메타데이터 로드
     # ──────────────────────────────
-    sections_df = load_sections(page_config["sections_csv"])
-    banners_df  = load_banners(page_config["banners_csv"])
+    _token = _meta_token()
+    sections_df = load_sections(page_config["sections_csv"], _refresh_token=_token)
+    banners_df  = load_banners(page_config["banners_csv"], _refresh_token=_token)
 
     # ──────────────────────────────
     # 이벤트 데이터 로드
