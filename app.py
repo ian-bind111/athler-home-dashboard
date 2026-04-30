@@ -1203,8 +1203,15 @@ def render_scroll_depth(sec_summary, page_key="home"):
         df["_order"] = range(len(df))
     df = df.dropna(subset=["_order"]).sort_values("_order").reset_index(drop=True)
 
+    # 노이즈 섹션 제외: 이름 없는 섹션 + elementType이 margin/MARGIN/space 등
+    if "memo" in df.columns:
+        df = df[df["memo"].fillna("").astype(str).str.strip() != ""]
+    if "elementType" in df.columns:
+        df = df[~df["elementType"].fillna("").astype(str).str.upper().isin(["MARGIN", "SPACE", "DIVIDER"])]
+    df = df.reset_index(drop=True)
+
     if df.empty:
-        st.info("orderIndex 정보가 있는 섹션이 없습니다.")
+        st.info("표시할 섹션이 없습니다 (이름·유형 필터 적용 후).")
         return
 
     first_unique = float(df.iloc[0].get("unique_impressed", 0) or 0)
@@ -1215,8 +1222,7 @@ def render_scroll_depth(sec_summary, page_key="home"):
 
     # 뎁스 계산
     df["섹션 순서"] = df["_order"].astype(int).astype(str) + "번"
-    df["섹션명"]    = df.get("memo", "—").fillna("(이름 없음)")
-    df["섹션명"]    = df["섹션명"].apply(lambda x: x if str(x).strip() else "(이름 없음)")
+    df["섹션명"]    = df.get("memo", "—").astype(str)
     if first_unique > 0:
         df["순노출 뎁스(%)"] = (df["unique_impressed"] / first_unique * 100).round(1)
     else:
