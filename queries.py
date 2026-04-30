@@ -287,7 +287,9 @@ LIMIT 200
 
 def get_section_impressions(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
-    섹션별 노출 수 (content_impressed 이벤트)
+    섹션별 노출 수 (content_impressed + product_impressed 이벤트)
+    - content_impressed: 일반 섹션 (배너/타이틀/아이콘 등)
+    - product_impressed: PRODUCT 타입 섹션 (DUAL_LIST, FLAT_STACK 등)
     반환 컬럼: event_date, section_uuid, impressions, unique_impressed
     """
     date_filter = _date_conditions(start_date, end_date)
@@ -299,7 +301,7 @@ SELECT
     COUNT(DISTINCT distinct_id)        AS unique_impressed
 FROM {TABLE}
 WHERE {date_filter}
-  AND event = 'content_impressed'
+  AND event IN ('content_impressed', 'product_impressed')
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
 GROUP BY 1, 2
@@ -311,7 +313,8 @@ LIMIT 5000
 
 def get_banner_impressions_by_position(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
-    배너 위치별 노출 수 (content_impressed 이벤트, idx 단위)
+    배너 위치별 노출 수 (content_impressed + product_impressed, idx 단위)
+    PRODUCT 섹션은 idx가 상품 순서를 의미하기도 함 — 배너 그리드/리스트의 위치 단위.
     반환 컬럼: event_date, section_uuid, banner_idx, impressions, unique_impressed
     """
     date_filter = _date_conditions(start_date, end_date)
@@ -324,7 +327,7 @@ SELECT
     COUNT(DISTINCT distinct_id)        AS unique_impressed
 FROM {TABLE}
 WHERE {date_filter}
-  AND event = 'content_impressed'
+  AND event IN ('content_impressed', 'product_impressed')
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
   AND idx IS NOT NULL
