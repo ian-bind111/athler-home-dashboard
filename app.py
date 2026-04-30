@@ -1213,13 +1213,20 @@ def render_scroll_depth(sec_summary, page_key="home"):
     # 노이즈/개인화 섹션 제외:
     #   - 이름 없는 섹션
     #   - 여백/구분선 (MARGIN/SPACE/DIVIDER)
-    #   - 개인화 컴포넌트 (RECENTLY_VIEWED_BRAND 등) — 일부 사용자에게만 노출돼 뎁스 왜곡
+    #   - 개인화/노출 미추적 컴포넌트 (RECENTLY_VIEWED_BRAND, BEST_PRODUCT_SECTION 등)
+    #     → 노출 이벤트가 안 나오거나 일부 사용자에게만 발생해 뎁스 곡선 왜곡
     if "memo" in df.columns:
         df = df[df["memo"].fillna("").astype(str).str.strip() != ""]
     if "elementType" in df.columns:
         df = df[~df["elementType"].fillna("").astype(str).str.upper().isin(["MARGIN", "SPACE", "DIVIDER"])]
     if "uiType" in df.columns:
-        df = df[~df["uiType"].fillna("").astype(str).str.upper().isin(["RECENTLY_VIEWED_BRAND"])]
+        df = df[~df["uiType"].fillna("").astype(str).str.upper().isin([
+            "RECENTLY_VIEWED_BRAND",   # 개인화 (브랜드 본 사용자만)
+            "BEST_PRODUCT_SECTION",    # Weekly Best - 노출 이벤트 미구현
+        ])]
+    # 노출이 0건인 섹션도 뎁스 계산 의미 없으므로 제외 (분모 노이즈 제거)
+    if "unique_impressed" in df.columns:
+        df = df[df["unique_impressed"].fillna(0).astype(int) > 0]
     df = df.reset_index(drop=True)
 
     if df.empty:
@@ -1380,55 +1387,63 @@ def render_dashboard(page_config: dict):
         st.write("")
         if nav_page:
             st.page_link(nav_page, label=f"{nav_icon} {nav_label}", use_container_width=True)
-        # 메타 새로고침 버튼: athler.kr 페이지를 다시 긁어 섹션명/배너 정보 갱신
+        # 메타 새로고침 버튼: 홈+아울렛 모두 athler.co.kr API에서 다시 가져와 갱신
         if st.button(
             "🔄 메타 새로고침",
-            help=f"{page_config['page_url']} 페이지의 섹션명/배너 이미지/링크를 athler.co.kr API에서 다시 가져옵니다 (~10초).",
+            help="홈/아울렛 페이지의 섹션명·배너 이미지·링크를 athler.co.kr API에서 한 번에 다시 가져옵니다 (~20초).",
             key=f"refresh_meta_{page_key}",
             use_container_width=True,
         ):
-            with st.spinner("athler API에서 최신 정보를 가져오는 중..."):
+            with st.spinner("athler API에서 홈+아울렛 최신 정보를 가져오는 중..."):
                 try:
                     import json as _json
                     import subprocess
                     import sys as _sys
-                    sections_path = os.path.join(
-                        BASE_DIR, "data",
-                        os.path.basename(page_config["sections_csv"]),
-                    )
-                    banners_path = os.path.join(
-                        BASE_DIR, "data",
-                        os.path.basename(page_config["banners_csv"]),
-                    )
-                    # athler.co.kr API 직접 호출 (requests 기반, Cloud에서도 작동)
-                    proc = subprocess.run(
-                        [
-                            _sys.executable,
-                            os.path.join(BASE_DIR, "meta_refresh.py"),
-                            page_config["page_name"],   # 'home' 또는 'outlet'
-                            sections_path,
-                            banners_path,
-                        ],
-                        capture_output=True, text=True, encoding="utf-8",
-                        timeout=60,
-                    )
-                    last_line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else "{}"
-                    try:
-                        out = _json.loads(last_line)
-                    except Exception:
-                        out = {"error": f"응답 파싱 실패: {last_line[:200]}"}
-                    if proc.returncode != 0 or "error" in out:
-                        err_msg = out.get("error") or proc.stderr[-300:] or "알 수 없는 오류"
-                        st.error(f"❌ 새로고침 실패: {err_msg}")
-                    else:
-                        st.cache_data.clear()
-                        st.success(
-                            f"✅ 새로고침 완료 — 섹션 {out['section_count']}개, "
-                            f"배너 {out['banner_count']}개"
+
+                    # 홈/아울렛 두 페이지 메타를 모두 갱신
+                    pages_to_refresh = [
+                        ("home",   PAGE_HOME["sections_csv"],   PAGE_HOME["banners_csv"]),
+                        ("outlet", PAGE_OUTLET["sections_csv"], PAGE_OUTLET["banners_csv"]),
+                    ]
+                    results, errors = [], []
+                    for pname, sec_csv, ban_csv in pages_to_refresh:
+                        sections_path = os.path.join(BASE_DIR, "data", os.path.basename(sec_csv))
+                        banners_path  = os.path.join(BASE_DIR, "data", os.path.basename(ban_csv))
+                        proc = subprocess.run(
+                            [
+                                _sys.executable,
+                                os.path.join(BASE_DIR, "meta_refresh.py"),
+                                pname,
+                                sections_path,
+                                banners_path,
+                            ],
+                            capture_output=True, text=True, encoding="utf-8",
+                            timeout=60,
                         )
-                        st.rerun()
+                        last_line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else "{}"
+                        try:
+                            out = _json.loads(last_line)
+                        except Exception:
+                            out = {"error": f"응답 파싱 실패: {last_line[:200]}"}
+                        if proc.returncode != 0 or "error" in out:
+                            err_msg = out.get("error") or proc.stderr[-300:] or "알 수 없는 오류"
+                            errors.append(f"[{pname}] {err_msg}")
+                        else:
+                            results.append((pname, out["section_count"], out["banner_count"]))
+
+                    if errors:
+                        st.error("❌ 새로고침 실패\n\n" + "\n".join(errors))
+                    if results:
+                        st.cache_data.clear()
+                        msg_lines = [
+                            f"- **{p}**: 섹션 {s}개, 배너 {b}개"
+                            for p, s, b in results
+                        ]
+                        st.success("✅ 새로고침 완료\n\n" + "\n".join(msg_lines))
+                        if not errors:
+                            st.rerun()
                 except subprocess.TimeoutExpired:
-                    st.error("❌ 새로고침 시간 초과 (3분). athler.kr 응답이 너무 느립니다.")
+                    st.error("❌ 새로고침 시간 초과. athler.co.kr 응답이 너무 느립니다.")
                 except Exception as e:
                     st.error(f"❌ 새로고침 실패: {type(e).__name__}: {e}")
 
