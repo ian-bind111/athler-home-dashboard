@@ -365,6 +365,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_page_visitors,
             get_section_impressions,
             get_banner_impressions_by_position,
+            get_user_section_pairs,
             get_banner_last_touch_gmv2,
         )
         page_name = page_config["page_name"]
@@ -378,15 +379,17 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             view_event_name=view_event,
             page_name=view_page_name,
         )
-        # 섹션/배너 노출 (실패 시 빈값으로 폴백)
+        # 섹션/배너 노출 + 사용자별 도달 섹션 (실패 시 빈값으로 폴백)
         impr_error = None
         try:
-            sec_impr     = get_section_impressions(start_date, end_date, page_name=page_name)
-            banner_impr  = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
+            sec_impr      = get_section_impressions(start_date, end_date, page_name=page_name)
+            banner_impr   = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
+            user_sec_df   = get_user_section_pairs(start_date, end_date, page_name=page_name)
         except Exception as e:
-            sec_impr     = pd.DataFrame()
-            banner_impr  = pd.DataFrame()
-            impr_error   = f"{type(e).__name__}: {e}"
+            sec_impr      = pd.DataFrame()
+            banner_impr   = pd.DataFrame()
+            user_sec_df   = pd.DataFrame()
+            impr_error    = f"{type(e).__name__}: {e}"
         # Last-touch GMV2 (클릭 후 7일 이내 결제 귀속): 실패해도 본 데이터 유지
         gmv2_error = None
         try:
@@ -400,6 +403,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             "home_visitors":      visitors,
             "section_impressions": sec_impr,
             "banner_impressions":  banner_impr,
+            "user_section_pairs":  user_sec_df,
             "impr_error":         impr_error,
             "banner_gmv2":        banner_gmv2,
             "gmv2_error":         gmv2_error,
@@ -514,12 +518,31 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
             })
     banner_impr_df = pd.DataFrame(banner_impr_rows)
 
+    # 데모용 사용자-섹션 쌍 (도달 깊이 분포용 - 위에서 아래로 갈수록 사용자 줄어듦)
+    n_users = 5000
+    user_sec_pairs = []
+    sections_sorted = sections_df.sort_values("orderIndex") if "orderIndex" in sections_df.columns else sections_df
+    for ui in range(n_users):
+        # 각 사용자가 도달하는 깊이를 지수 분포로 시뮬레이션
+        max_depth = max(1, int(rng.exponential(scale=8)))
+        max_depth = min(max_depth, len(sections_sorted))
+        user_id = f"demo_user_{ui}"
+        for j in range(max_depth):
+            user_sec_pairs.append({
+                "distinct_id": user_id,
+                "section_uuid": str(sections_sorted.iloc[j]["section_uuid"]),
+            })
+    user_sec_df = pd.DataFrame(user_sec_pairs) if user_sec_pairs else pd.DataFrame(
+        columns=["distinct_id", "section_uuid"]
+    )
+
     return {
         "section_clicks": sec_click_df,
         "banner_pos_clicks": banner_pos_df,
         "home_visitors": visitor_df,
         "section_impressions": sec_impr_df,
         "banner_impressions": banner_impr_df,
+        "user_section_pairs": user_sec_df,
         "impr_error": None,
         "banner_gmv2": banner_gmv2_df,
         "gmv2_error": None,
@@ -1346,6 +1369,194 @@ def render_scroll_depth(sec_summary, page_key="home"):
 
 
 # ──────────────────────────────────────────────
+# 9-2c. 유저 도달 깊이 분포 (Funnel — 사용자 단위 누적)
+# ──────────────────────────────────────────────
+def render_user_reach_depth(sections_df, user_sec_df, page_key="home"):
+    """
+    각 사용자(distinct_id)의 max(orderIndex) = 그 사람의 페이지 도달 깊이.
+    "N번 이상까지 도달한 사용자 수"를 구간별로 누적 집계 → 단조감소 funnel 곡선.
+
+    스크롤 뎁스(섹션 단위 노출)와 달리, 이 분석은 **사용자 행동만** 추적해요:
+    - 빠르게 스크롤해서 N번 섹션 노출 안 됐어도 N+5까지 갔으면 N 깊이까지 도달한 걸로 카운트
+    - 컴포넌트 노출 효율 차이에 영향 받지 않음
+    """
+    st.subheader("👣 유저 도달 깊이 분포")
+    st.caption(
+        "사용자 단위로 **페이지 어디까지 내려갔는지** 측정해요. "
+        "각 사용자의 가장 깊은 섹션을 찾아, 'N번 이상까지 도달한 사용자' 비율을 누적 표시. "
+        "**단조 감소 곡선** — 깊어질수록 인원은 절대 늘 수 없음. "
+        "**스크롤 뎁스 탭(섹션 단위 노출)과 다른 시각**이에요."
+    )
+
+    if sections_df is None or sections_df.empty:
+        st.info("섹션 메타가 없습니다.")
+        return
+    if user_sec_df is None or user_sec_df.empty:
+        st.info("사용자-섹션 노출 데이터가 없습니다.")
+        return
+
+    # ── 섹션 메타 준비 (orderIndex + 필터)
+    sec_meta = sections_df.copy()
+    if "orderIndex" not in sec_meta.columns:
+        st.info("섹션 orderIndex가 없어 도달 깊이를 계산할 수 없습니다.")
+        return
+
+    # 스크롤 뎁스와 동일한 필터 (이름 없음, MARGIN, 개인화 컴포넌트 제외)
+    if "memo" in sec_meta.columns:
+        sec_meta = sec_meta[sec_meta["memo"].fillna("").astype(str).str.strip() != ""]
+    if "elementType" in sec_meta.columns:
+        sec_meta = sec_meta[~sec_meta["elementType"].fillna("").astype(str).str.upper().isin(
+            ["MARGIN", "SPACE", "DIVIDER"]
+        )]
+    if "uiType" in sec_meta.columns:
+        sec_meta = sec_meta[~sec_meta["uiType"].fillna("").astype(str).str.upper().isin([
+            "RECENTLY_VIEWED_BRAND", "BEST_PRODUCT_SECTION",
+        ])]
+    sec_meta = sec_meta.dropna(subset=["orderIndex"]).copy()
+    sec_meta["orderIndex"] = pd.to_numeric(sec_meta["orderIndex"], errors="coerce")
+    sec_meta = sec_meta.dropna(subset=["orderIndex"]).reset_index(drop=True)
+    sec_meta["section_uuid"] = sec_meta["section_uuid"].astype(str)
+    sec_meta = sec_meta.sort_values("orderIndex").reset_index(drop=True)
+
+    if sec_meta.empty:
+        st.info("필터 적용 후 표시할 섹션이 없습니다.")
+        return
+
+    # ── 사용자별 max orderIndex (도달 깊이) 계산
+    pairs = user_sec_df.copy()
+    pairs["section_uuid"] = pairs["section_uuid"].astype(str)
+    pairs = pairs.merge(
+        sec_meta[["section_uuid", "orderIndex"]],
+        on="section_uuid", how="inner",
+    )
+    if pairs.empty:
+        st.info("필터 통과한 섹션과 매칭되는 사용자 노출이 없습니다.")
+        return
+
+    user_max_depth = pairs.groupby("distinct_id")["orderIndex"].max()
+    total_users = int(user_max_depth.shape[0])
+    if total_users == 0:
+        st.info("측정 가능한 사용자가 없습니다.")
+        return
+
+    # ── 각 섹션 깊이별 funnel 계산: orderIndex >= N 인 사용자 수
+    rows = []
+    for _, sec in sec_meta.iterrows():
+        depth = int(sec["orderIndex"])
+        reached = int((user_max_depth >= depth).sum())
+        ratio = round(reached / total_users * 100, 1) if total_users > 0 else 0.0
+        rows.append({
+            "depth_label": f"{depth}번",
+            "depth": depth,
+            "section_name": (sec.get("memo") or "—") if str(sec.get("memo", "")).strip() else "—",
+            "reached_users": reached,
+            "ratio": ratio,
+            "uiType": sec.get("uiType", "—"),
+        })
+    funnel_df = pd.DataFrame(rows)
+
+    # ── 핵심 KPI
+    drop_50_idx = None
+    for i in range(1, len(funnel_df)):  # 첫 섹션은 100%이므로 건너뜀
+        if funnel_df.iloc[i]["ratio"] < 50.0:
+            drop_50_idx = i
+            break
+
+    drop_30_idx = None
+    for i in range(1, len(funnel_df)):
+        if funnel_df.iloc[i]["ratio"] < 30.0:
+            drop_30_idx = i
+            break
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("측정 사용자 수", f"{total_users:,}")
+    last_pct = float(funnel_df.iloc[-1]["ratio"]) if not funnel_df.empty else 0
+    k2.metric("마지막 섹션 도달률", f"{last_pct:.1f}%",
+              delta=f"{int(funnel_df.iloc[-1]['reached_users']):,}명",
+              delta_color="off")
+    if drop_50_idx is not None:
+        row50 = funnel_df.iloc[drop_50_idx]
+        k3.metric("50% 도달 컷오프", f"{row50['depth']}번",
+                  delta=str(row50['section_name'])[:12], delta_color="off")
+    else:
+        k3.metric("50% 도달 컷오프", "없음", delta="모든 섹션 ≥50%", delta_color="off")
+    if drop_30_idx is not None:
+        row30 = funnel_df.iloc[drop_30_idx]
+        k4.metric("30% 도달 컷오프", f"{row30['depth']}번",
+                  delta=str(row30['section_name'])[:12], delta_color="off")
+    else:
+        k4.metric("30% 도달 컷오프", "없음", delta="모든 섹션 ≥30%", delta_color="off")
+
+    st.markdown("---")
+    st.markdown("### 📈 도달 깊이 Funnel (단조 감소)")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=funnel_df["depth_label"],
+        y=funnel_df["ratio"],
+        mode="lines+markers+text",
+        name="도달 비율",
+        text=funnel_df["ratio"].astype(str) + "%",
+        textposition="top center",
+        line=dict(color="#10B981", width=3, shape="hv"),
+        marker=dict(size=10),
+        customdata=funnel_df[["section_name", "reached_users"]],
+        hovertemplate=(
+            "<b>%{x} %{customdata[0]}</b><br>"
+            "도달: %{y}%<br>"
+            "도달자: %{customdata[1]:,}명"
+            "<extra></extra>"
+        ),
+    ))
+    # Area fill 효과를 위한 보조 trace
+    fig.add_trace(go.Scatter(
+        x=funnel_df["depth_label"],
+        y=funnel_df["ratio"],
+        fill="tozeroy",
+        fillcolor="rgba(16, 185, 129, 0.1)",
+        line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+    fig.add_hline(y=100, line_dash="dash", line_color="#888",
+                  annotation_text="전체 사용자 = 100%", annotation_position="top right")
+    fig.add_hline(y=50, line_dash="dot", line_color="#FF6B6B",
+                  annotation_text="50% 라인", annotation_position="bottom right")
+    fig.add_hline(y=30, line_dash="dot", line_color="#FFA500",
+                  annotation_text="30% 라인", annotation_position="bottom right")
+    fig.update_layout(
+        title=f"각 깊이까지 도달한 사용자 비율 (총 {total_users:,}명 기준)",
+        xaxis_title="섹션 깊이 (페이지 위 → 아래)",
+        yaxis_title="도달 비율 (%)",
+        yaxis=dict(range=[0, 105]),
+        height=460,
+        margin=dict(l=0, r=0, t=50, b=0),
+        hovermode="x unified",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── 상세표
+    st.markdown("### 📋 깊이별 도달 상세")
+    table_df = funnel_df.rename(columns={
+        "depth": "순서",
+        "section_name": "섹션명",
+        "uiType": "UI 타입",
+        "reached_users": "도달 사용자",
+        "ratio": "도달률 (%)",
+    })[["순서", "섹션명", "UI 타입", "도달 사용자", "도달률 (%)"]]
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "💡 **해석**: 단조 감소 곡선의 **가파른 구간이 사용자 이탈 지점**이에요. "
+        "예를 들어 7번~8번 사이에서 80% → 50%로 떨어지면, **그 위치에서 사용자 절반이 떠나는 것**. "
+        "스크롤 뎁스(섹션 노출)는 컴포넌트 효율 영향을 받지만, "
+        "이 도달 분포는 **순수 사용자 행동**만 반영해서 더 정확한 이탈 분석이 가능해요. "
+        "측정 단위는 distinct_id (디바이스/세션 기준 고유 사용자)."
+    )
+
+
+# ──────────────────────────────────────────────
 # 10. 메인 대시보드 렌더링 (페이지 설정 인자로 범용화)
 # ──────────────────────────────────────────────
 def render_dashboard(page_config: dict):
@@ -1550,12 +1761,13 @@ def render_dashboard(page_config: dict):
     if src == "demo":
         st.caption("※ 아래 수치는 실제 데이터가 아닌 예시입니다.")
 
-    sec_click_df    = raw.get("section_clicks",     pd.DataFrame())
-    banner_pos_df   = raw.get("banner_pos_clicks",  pd.DataFrame())
-    visitor_df      = raw.get("home_visitors",      pd.DataFrame())
+    sec_click_df    = raw.get("section_clicks",      pd.DataFrame())
+    banner_pos_df   = raw.get("banner_pos_clicks",   pd.DataFrame())
+    visitor_df      = raw.get("home_visitors",       pd.DataFrame())
     sec_impr_df     = raw.get("section_impressions", pd.DataFrame())
     banner_impr_df  = raw.get("banner_impressions",  pd.DataFrame())
-    banner_gmv2_df  = raw.get("banner_gmv2",        pd.DataFrame())
+    user_sec_df     = raw.get("user_section_pairs",  pd.DataFrame())
+    banner_gmv2_df  = raw.get("banner_gmv2",         pd.DataFrame())
     impr_error      = raw.get("impr_error")
     gmv2_error      = raw.get("gmv2_error")
 
@@ -1599,8 +1811,9 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 탭
     # ──────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["종합 요약", "섹션별 분석", "배너별 분석", "스크롤 뎁스", "스와이프 뎁스", "상세 비교"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["종합 요약", "섹션별 분석", "배너별 분석",
+         "스크롤 뎁스", "유저 도달 깊이 분포", "스와이프 뎁스", "상세 비교"]
     )
 
     # ════════════════════════════════════════════
@@ -1961,21 +2174,27 @@ def render_dashboard(page_config: dict):
             st.info("배너를 선택하거나 기간 데이터가 없습니다.")
 
     # ════════════════════════════════════════════
-    # TAB 4 — 스크롤 뎁스 (섹션 단위, 페이지 세로 스크롤 깊이)
+    # TAB 4 — 스크롤 뎁스 (섹션 단위 노출 비율)
     # ════════════════════════════════════════════
     with tab4:
         render_scroll_depth(sec_summary, page_key=page_key)
 
     # ════════════════════════════════════════════
-    # TAB 5 — 스와이프 뎁스 (섹션 안 idx별, 가로 스와이프 깊이)
+    # TAB 5 — 유저 도달 깊이 분포 (Funnel — 사용자 단위 누적)
     # ════════════════════════════════════════════
     with tab5:
+        render_user_reach_depth(sections_df, user_sec_df, page_key=page_key)
+
+    # ════════════════════════════════════════════
+    # TAB 6 — 스와이프 뎁스 (섹션 안 idx별, 가로 스와이프 깊이)
+    # ════════════════════════════════════════════
+    with tab6:
         render_swipe_depth(sec_summary, banner_summary, page_key=page_key)
 
     # ════════════════════════════════════════════
-    # TAB 6 — 상세 비교
+    # TAB 7 — 상세 비교
     # ════════════════════════════════════════════
-    with tab6:
+    with tab7:
         st.subheader("섹션 / 배너 상세 비교")
 
         comp_type = st.radio("비교 단위", ["섹션", "배너"], horizontal=True, key=f"comp_radio_{page_key}")

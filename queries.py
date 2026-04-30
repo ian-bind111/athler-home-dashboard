@@ -311,6 +311,32 @@ LIMIT 5000
     return run_query(sql)
 
 
+def get_user_section_pairs(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    사용자(distinct_id) × 섹션(element_uuid)의 DISTINCT 쌍 추출
+    -> 도달 깊이 분포(funnel) 계산용
+    각 사용자가 어떤 섹션들을 봤는지 알면, 그 사용자의 max(orderIndex)가 도달 깊이.
+
+    반환 컬럼: distinct_id, section_uuid
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    distinct_id,
+    element_uuid AS section_uuid
+FROM {TABLE}
+WHERE {date_filter}
+  AND event IN ('content_impressed', 'product_impressed')
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+  AND distinct_id IS NOT NULL
+  AND distinct_id <> ''
+GROUP BY distinct_id, element_uuid
+LIMIT 500000
+    """
+    return run_query(sql)
+
+
 def get_banner_impressions_by_position(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
     배너 위치별 노출 수 (content_impressed + product_impressed, idx 단위)
