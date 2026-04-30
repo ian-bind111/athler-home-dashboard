@@ -285,6 +285,56 @@ LIMIT 200
     return run_query(sql)
 
 
+def get_section_impressions(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    섹션별 노출 수 (content_impressed 이벤트)
+    반환 컬럼: event_date, section_uuid, impressions, unique_impressed
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    CONCAT(year, '-', month, '-', day) AS event_date,
+    element_uuid                       AS section_uuid,
+    COUNT(*)                           AS impressions,
+    COUNT(DISTINCT distinct_id)        AS unique_impressed
+FROM {TABLE}
+WHERE {date_filter}
+  AND event = 'content_impressed'
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+GROUP BY 1, 2
+ORDER BY 1 DESC, 3 DESC
+LIMIT 5000
+    """
+    return run_query(sql)
+
+
+def get_banner_impressions_by_position(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    배너 위치별 노출 수 (content_impressed 이벤트, idx 단위)
+    반환 컬럼: event_date, section_uuid, banner_idx, impressions, unique_impressed
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    CONCAT(year, '-', month, '-', day) AS event_date,
+    element_uuid                       AS section_uuid,
+    CAST(idx AS VARCHAR)               AS banner_idx,
+    COUNT(*)                           AS impressions,
+    COUNT(DISTINCT distinct_id)        AS unique_impressed
+FROM {TABLE}
+WHERE {date_filter}
+  AND event = 'content_impressed'
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+  AND idx IS NOT NULL
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, 4 DESC
+LIMIT 10000
+    """
+    return run_query(sql)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Last-touch GMV2 어트리뷰션 (클릭 후 7일 이내 결제)
 #

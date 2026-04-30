@@ -356,19 +356,30 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_section_clicks,
             get_banner_clicks_by_position,
             get_page_visitors,
+            get_section_impressions,
+            get_banner_impressions_by_position,
             get_banner_last_touch_gmv2,
         )
         page_name = page_config["page_name"]
         view_event = page_config["view_event"]
         view_page_name = page_config.get("view_page_name")
 
-        sec_clicks   = get_section_clicks(start_date, end_date, page_name=page_name)
-        banner_pos   = get_banner_clicks_by_position(start_date, end_date, page_name=page_name)
-        visitors     = get_page_visitors(
+        sec_clicks    = get_section_clicks(start_date, end_date, page_name=page_name)
+        banner_pos    = get_banner_clicks_by_position(start_date, end_date, page_name=page_name)
+        visitors      = get_page_visitors(
             start_date, end_date,
             view_event_name=view_event,
             page_name=view_page_name,
         )
+        # 섹션/배너 노출 (실패 시 빈값으로 폴백)
+        impr_error = None
+        try:
+            sec_impr     = get_section_impressions(start_date, end_date, page_name=page_name)
+            banner_impr  = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
+        except Exception as e:
+            sec_impr     = pd.DataFrame()
+            banner_impr  = pd.DataFrame()
+            impr_error   = f"{type(e).__name__}: {e}"
         # Last-touch GMV2 (클릭 후 7일 이내 결제 귀속): 실패해도 본 데이터 유지
         gmv2_error = None
         try:
@@ -377,11 +388,14 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             banner_gmv2 = pd.DataFrame()
             gmv2_error = f"{type(e).__name__}: {e}"
         return {
-            "section_clicks":    sec_clicks,
-            "banner_pos_clicks": banner_pos,
-            "home_visitors":     visitors,
-            "banner_gmv2":       banner_gmv2,
-            "gmv2_error":        gmv2_error,
+            "section_clicks":     sec_clicks,
+            "banner_pos_clicks":  banner_pos,
+            "home_visitors":      visitors,
+            "section_impressions": sec_impr,
+            "banner_impressions":  banner_impr,
+            "impr_error":         impr_error,
+            "banner_gmv2":        banner_gmv2,
+            "gmv2_error":         gmv2_error,
             "source": "live",
         }
     except Exception as e:
@@ -461,10 +475,45 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
                  "attributed_gmv2", "attributed_orders", "attributed_users"]
     )
 
+    # 데모용 섹션/배너 노출
+    sec_impr_rows = []
+    for _, s in sections_df.iterrows():
+        base_impr = int(rng.integers(2000, 60000))
+        for d in days_list:
+            impr = max(10, int(base_impr * rng.uniform(0.7, 1.3)))
+            sec_impr_rows.append({
+                "event_date": d,
+                "section_uuid": s["section_uuid"],
+                "impressions": impr,
+                "unique_impressed": int(impr * rng.uniform(0.4, 0.7)),
+            })
+    sec_impr_df = pd.DataFrame(sec_impr_rows)
+
+    banner_impr_rows = []
+    for _, b in banners_df.iterrows():
+        order_n = int(b.get("banner_orderIndex", 1))
+        # idx가 클수록 노출 수 감소 (스크롤 뎁스 시뮬레이션)
+        depth_factor = max(0.05, 1.0 - (order_n - 1) * 0.12)
+        base_impr = max(50, int(rng.integers(500, 5000) * depth_factor))
+        idx_val = str(order_n - 1)
+        for d in days_list:
+            impr = max(5, int(base_impr * rng.uniform(0.7, 1.3)))
+            banner_impr_rows.append({
+                "event_date": d,
+                "section_uuid": b["section_uuid"],
+                "banner_idx": idx_val,
+                "impressions": impr,
+                "unique_impressed": int(impr * rng.uniform(0.5, 0.8)),
+            })
+    banner_impr_df = pd.DataFrame(banner_impr_rows)
+
     return {
         "section_clicks": sec_click_df,
         "banner_pos_clicks": banner_pos_df,
         "home_visitors": visitor_df,
+        "section_impressions": sec_impr_df,
+        "banner_impressions": banner_impr_df,
+        "impr_error": None,
         "banner_gmv2": banner_gmv2_df,
         "gmv2_error": None,
         "source": "demo",
@@ -476,8 +525,9 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
 # ──────────────────────────────────────────────
 def build_section_summary(sections_df: pd.DataFrame, sec_click_df: pd.DataFrame,
                            visitor_df: pd.DataFrame,
-                           banner_gmv2_df: pd.DataFrame = None) -> pd.DataFrame:
-    """섹션별 클릭 합산 + 메타 병합 + CTR 계산 + 섹션 단위 GMV2 (배너 GMV2 합산)"""
+                           banner_gmv2_df: pd.DataFrame = None,
+                           sec_impr_df: pd.DataFrame = None) -> pd.DataFrame:
+    """섹션별 클릭 합산 + 메타 병합 + CTR(노출 대비) + 섹션 단위 GMV2"""
     if not sec_click_df.empty and "section_uuid" in sec_click_df.columns:
         agg = (
             sec_click_df.groupby("section_uuid")
@@ -491,11 +541,31 @@ def build_section_summary(sections_df: pd.DataFrame, sec_click_df: pd.DataFrame,
     result["clicks"] = result["clicks"].fillna(0).astype(int)
     result["unique_users"] = result["unique_users"].fillna(0).astype(int)
 
-    total_visitors = visitor_df["unique_visitors"].sum() if not visitor_df.empty and "unique_visitors" in visitor_df.columns else 0
-    if total_visitors > 0:
-        result["CTR(%)"] = (result["clicks"] / total_visitors * 100).round(3)
+    # 섹션 노출 데이터 병합 (CTR 분모로 사용)
+    if sec_impr_df is not None and not sec_impr_df.empty and "section_uuid" in sec_impr_df.columns:
+        impr_agg = (
+            sec_impr_df.groupby("section_uuid")
+            .agg(impressions=("impressions", "sum"),
+                 unique_impressed=("unique_impressed", "sum"))
+            .reset_index()
+        )
+        result["section_uuid"] = result["section_uuid"].astype(str)
+        impr_agg["section_uuid"] = impr_agg["section_uuid"].astype(str)
+        result = result.merge(impr_agg, on="section_uuid", how="left")
     else:
-        result["CTR(%)"] = 0.0
+        result["impressions"] = 0
+        result["unique_impressed"] = 0
+
+    result["impressions"]      = result["impressions"].fillna(0).astype(int)
+    result["unique_impressed"] = result["unique_impressed"].fillna(0).astype(int)
+
+    # CTR = 순 클릭자 / 순 노출자 × 100  (노출 대비, 사용자 단위)
+    def _safe_ctr(num, den):
+        return round(num / den * 100, 3) if den > 0 else 0.0
+    result["CTR(%)"] = result.apply(
+        lambda r: _safe_ctr(r["unique_users"], r["unique_impressed"]),
+        axis=1,
+    )
 
     # ── 섹션 단위 GMV2 = 그 섹션 안 모든 배너의 last-touch GMV2 합
     if banner_gmv2_df is not None and not banner_gmv2_df.empty:
@@ -521,8 +591,9 @@ def build_section_summary(sections_df: pd.DataFrame, sec_click_df: pd.DataFrame,
 
 def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
                           visitor_df: pd.DataFrame,
-                          banner_gmv2_df: pd.DataFrame = None) -> pd.DataFrame:
-    """배너(위치 기반) 클릭 합산 + 메타 병합 + CTR 계산 + last-touch GMV2 병합"""
+                          banner_gmv2_df: pd.DataFrame = None,
+                          banner_impr_df: pd.DataFrame = None) -> pd.DataFrame:
+    """배너(위치 기반) 클릭 합산 + 메타 병합 + CTR(노출 대비) + last-touch GMV2 병합"""
     if not banner_pos_df.empty and "section_uuid" in banner_pos_df.columns:
         agg = (
             banner_pos_df.groupby(["section_uuid", "banner_idx"])
@@ -544,11 +615,31 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
     result["clicks"] = result["clicks"].fillna(0).astype(int)
     result["unique_users"] = result["unique_users"].fillna(0).astype(int)
 
-    total_visitors = visitor_df["unique_visitors"].sum() if not visitor_df.empty and "unique_visitors" in visitor_df.columns else 0
-    if total_visitors > 0:
-        result["CTR(%)"] = (result["clicks"] / total_visitors * 100).round(4)
+    # 배너 위치별 노출 데이터 병합
+    if banner_impr_df is not None and not banner_impr_df.empty and "section_uuid" in banner_impr_df.columns:
+        impr_agg = (
+            banner_impr_df.groupby(["section_uuid", "banner_idx"])
+            .agg(impressions=("impressions", "sum"),
+                 unique_impressed=("unique_impressed", "sum"))
+            .reset_index()
+        )
+        impr_agg["section_uuid"] = impr_agg["section_uuid"].astype(str)
+        impr_agg["banner_idx"]   = impr_agg["banner_idx"].astype(str)
+        result = result.merge(impr_agg, on=["section_uuid", "banner_idx"], how="left")
     else:
-        result["CTR(%)"] = 0.0
+        result["impressions"]      = 0
+        result["unique_impressed"] = 0
+
+    result["impressions"]      = result["impressions"].fillna(0).astype(int)
+    result["unique_impressed"] = result["unique_impressed"].fillna(0).astype(int)
+
+    # CTR = 순 클릭자 / 순 노출자 × 100 (노출 대비, 배너 위치 단위)
+    def _safe_ctr(num, den):
+        return round(num / den * 100, 4) if den > 0 else 0.0
+    result["CTR(%)"] = result.apply(
+        lambda r: _safe_ctr(r["unique_users"], r["unique_impressed"]),
+        axis=1,
+    )
 
     # ── Last-touch GMV2 병합
     if banner_gmv2_df is not None and not banner_gmv2_df.empty:
@@ -887,6 +978,201 @@ def render_section_perf_table(sec_summary):
 
 
 # ──────────────────────────────────────────────
+# 9-2. 스크롤 뎁스 (idx별 노출 비율로 사용자 스크롤 깊이 측정)
+# ──────────────────────────────────────────────
+def render_scroll_depth(sec_summary, banner_summary, page_key="home"):
+    """
+    섹션별로 idx 1번(=banner_orderIndex 1) 노출을 100%로 두고,
+    뒤쪽 idx(2,3,...)의 상대 노출 비율을 보여줘서 사용자가 어디까지 스크롤/스와이프했는지 측정.
+    """
+    st.subheader("📜 스크롤 뎁스 분석")
+    st.caption(
+        "각 섹션의 **1번째 위치 노출**을 100%로 잡고, 뒤쪽 위치의 노출 비율을 보여드려요. "
+        "값이 가파르게 떨어지면 사용자가 그 지점부터 안 보고 이탈한다는 뜻이에요. "
+        "(스와이프 캐러셀 / 가로 스크롤 영역에 특히 의미 있어요.)"
+    )
+
+    if banner_summary is None or banner_summary.empty:
+        st.info("배너 노출 데이터가 없습니다.")
+        return
+    if "impressions" not in banner_summary.columns:
+        st.info("노출 데이터가 로드되지 않았습니다.")
+        return
+
+    # 노출이 있는 섹션만 대상
+    sections_with_impr = (
+        banner_summary.groupby("section_uuid")["impressions"].sum().reset_index()
+    )
+    sections_with_impr = sections_with_impr[sections_with_impr["impressions"] > 0]
+    valid_uuids = set(sections_with_impr["section_uuid"].astype(str))
+
+    sec_for_depth = sec_summary[sec_summary["section_uuid"].astype(str).isin(valid_uuids)].copy()
+    if sec_for_depth.empty:
+        st.info("노출 데이터가 있는 섹션이 없습니다.")
+        return
+
+    # ── 섹션별 스크롤 뎁스 요약표 (전체 섹션 한눈에)
+    st.markdown("### 🗂️ 섹션별 뎁스 요약 (1번 위치 = 100%)")
+    summary_rows = []
+    for _, sec in sec_for_depth.iterrows():
+        sec_uuid = str(sec["section_uuid"])
+        sec_banners = banner_summary[banner_summary["section_uuid"].astype(str) == sec_uuid].copy()
+        if sec_banners.empty:
+            continue
+        # banner_orderIndex 가 있으면 그걸로, 없으면 banner_idx 로 정렬 (1번부터)
+        if "banner_orderIndex" in sec_banners.columns:
+            sec_banners["_o"] = pd.to_numeric(sec_banners["banner_orderIndex"], errors="coerce")
+        else:
+            sec_banners["_o"] = pd.to_numeric(sec_banners["banner_idx"], errors="coerce") + 1
+        sec_banners = sec_banners.dropna(subset=["_o"]).sort_values("_o")
+        if sec_banners.empty:
+            continue
+        first_impr = float(sec_banners.iloc[0].get("impressions", 0) or 0)
+        if first_impr <= 0:
+            continue
+        last_pos = sec_banners["_o"].max()
+        last_impr = float(sec_banners.iloc[-1].get("impressions", 0) or 0)
+        last_ratio = round(last_impr / first_impr * 100, 1) if first_impr > 0 else 0.0
+        # 50% 이하로 떨어지는 첫 위치 찾기
+        drop_50_pos = None
+        for _, b in sec_banners.iterrows():
+            ratio = (float(b.get("impressions", 0) or 0) / first_impr * 100) if first_impr > 0 else 0
+            if ratio < 50.0:
+                drop_50_pos = int(b["_o"])
+                break
+        summary_rows.append({
+            "섹션명":        sec.get("memo", "—") or "—",
+            "섹션 ID":       sec.get("section_id", "—"),
+            "UI 타입":       sec.get("uiType", "—"),
+            "총 위치 수":    int(last_pos),
+            "1번 노출":      int(first_impr),
+            "마지막 노출":   int(last_impr),
+            "마지막 비율(%)": last_ratio,
+            "50%↓ 첫 위치": drop_50_pos if drop_50_pos else "—",
+        })
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows).sort_values("총 위치 수", ascending=False)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("뎁스 분석 가능한 섹션이 없습니다.")
+        return
+
+    st.markdown("---")
+    st.markdown("### 🔍 섹션 상세 뎁스 차트")
+
+    # 섹션 셀렉터 — 위치 수가 많은 순
+    sec_for_depth = sec_for_depth.copy()
+    sec_for_depth["_pos_cnt"] = sec_for_depth["section_uuid"].apply(
+        lambda u: int(banner_summary[banner_summary["section_uuid"].astype(str) == str(u)].shape[0])
+    )
+    sec_for_depth = sec_for_depth[sec_for_depth["_pos_cnt"] > 1].sort_values("_pos_cnt", ascending=False)
+
+    if sec_for_depth.empty:
+        st.info("위치가 2개 이상인 섹션이 없어 뎁스 차트를 그릴 수 없어요.")
+        return
+
+    sec_for_depth["depth_label"] = sec_for_depth.apply(
+        lambda r: f"{r.get('memo', '') or '(이름 없음)'} — {r['section_id']} ({r['_pos_cnt']}개 위치)",
+        axis=1,
+    )
+    label_to_uuid = dict(zip(sec_for_depth["depth_label"], sec_for_depth["section_uuid"].astype(str)))
+    sel_label = st.selectbox(
+        "섹션 선택",
+        sec_for_depth["depth_label"].tolist(),
+        key=f"depth_section_{page_key}",
+    )
+    sel_uuid = label_to_uuid.get(sel_label, "")
+    if not sel_uuid:
+        return
+
+    sec_banners = banner_summary[banner_summary["section_uuid"].astype(str) == sel_uuid].copy()
+    if "banner_orderIndex" in sec_banners.columns:
+        sec_banners["_o"] = pd.to_numeric(sec_banners["banner_orderIndex"], errors="coerce")
+    else:
+        sec_banners["_o"] = pd.to_numeric(sec_banners["banner_idx"], errors="coerce") + 1
+    sec_banners = sec_banners.dropna(subset=["_o"]).sort_values("_o").reset_index(drop=True)
+    sec_banners["_o"] = sec_banners["_o"].astype(int)
+
+    if sec_banners.empty or sec_banners.iloc[0].get("impressions", 0) == 0:
+        st.info("이 섹션의 1번 위치 노출 데이터가 없습니다.")
+        return
+
+    first_impr   = float(sec_banners.iloc[0]["impressions"])
+    first_unique = float(sec_banners.iloc[0].get("unique_impressed", 0) or 0)
+
+    sec_banners["뎁스(%)"] = (sec_banners["impressions"] / first_impr * 100).round(1)
+    if first_unique > 0:
+        sec_banners["순노출 뎁스(%)"] = (
+            sec_banners["unique_impressed"] / first_unique * 100
+        ).round(1)
+    else:
+        sec_banners["순노출 뎁스(%)"] = 0.0
+
+    sec_banners["위치"] = sec_banners["_o"].astype(str) + "번"
+
+    # ── 차트
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=sec_banners["위치"],
+        y=sec_banners["뎁스(%)"],
+        mode="lines+markers+text",
+        name="총 노출 기준",
+        text=sec_banners["뎁스(%)"].astype(str) + "%",
+        textposition="top center",
+        line=dict(color="#3182F6", width=3),
+        marker=dict(size=10),
+    ))
+    if first_unique > 0:
+        fig.add_trace(go.Scatter(
+            x=sec_banners["위치"],
+            y=sec_banners["순노출 뎁스(%)"],
+            mode="lines+markers",
+            name="순 노출자 기준",
+            line=dict(color="#FF9F43", width=2, dash="dot"),
+            marker=dict(size=8),
+        ))
+    fig.add_hline(y=100, line_dash="dash", line_color="#888",
+                  annotation_text="1번 위치 = 100%", annotation_position="top right")
+    fig.add_hline(y=50, line_dash="dot", line_color="#FF6B6B",
+                  annotation_text="50% 라인", annotation_position="bottom right")
+    fig.update_layout(
+        title=f"{sel_label.split(' — ')[0]} — 위치별 노출 비율",
+        xaxis_title="배너 위치",
+        yaxis_title="노출 비율 (%)",
+        height=420,
+        margin=dict(l=0, r=0, t=50, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=-0.2),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── 상세표
+    show_cols = ["위치", "impressions", "unique_impressed", "뎁스(%)", "순노출 뎁스(%)",
+                 "clicks", "unique_users", "CTR(%)"]
+    avail = [c for c in show_cols if c in sec_banners.columns]
+    rename_map = {
+        "impressions": "총 노출",
+        "unique_impressed": "순 노출자",
+        "clicks": "클릭",
+        "unique_users": "순 클릭자",
+        "CTR(%)": "CTR (%)",
+    }
+    table_df = sec_banners[avail].copy()
+    table_df.columns = [rename_map.get(c, c) for c in table_df.columns]
+    st.markdown("**위치별 상세**")
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "💡 **해석 가이드**: "
+        "총 노출 = 노출 발생 횟수 / 순 노출자 = DISTINCT 사용자. "
+        "캐러셀처럼 사용자가 직접 스와이프해야 하는 컴포넌트는 뒤쪽 위치 비율이 자연스럽게 떨어집니다. "
+        "**50% 라인 아래로 떨어지는 위치 = 사용자 절반이 안 보는 콘텐츠.** "
+        "이 위치 뒤로는 콘텐츠 우선순위를 재고하시면 좋아요."
+    )
+
+
+# ──────────────────────────────────────────────
 # 10. 메인 대시보드 렌더링 (페이지 설정 인자로 범용화)
 # ──────────────────────────────────────────────
 def render_dashboard(page_config: dict):
@@ -1074,13 +1360,20 @@ def render_dashboard(page_config: dict):
     if src == "demo":
         st.caption("※ 아래 수치는 실제 데이터가 아닌 예시입니다.")
 
-    sec_click_df    = raw.get("section_clicks",    pd.DataFrame())
-    banner_pos_df   = raw.get("banner_pos_clicks", pd.DataFrame())
-    visitor_df      = raw.get("home_visitors",     pd.DataFrame())
-    banner_gmv2_df  = raw.get("banner_gmv2",       pd.DataFrame())
+    sec_click_df    = raw.get("section_clicks",     pd.DataFrame())
+    banner_pos_df   = raw.get("banner_pos_clicks",  pd.DataFrame())
+    visitor_df      = raw.get("home_visitors",      pd.DataFrame())
+    sec_impr_df     = raw.get("section_impressions", pd.DataFrame())
+    banner_impr_df  = raw.get("banner_impressions",  pd.DataFrame())
+    banner_gmv2_df  = raw.get("banner_gmv2",        pd.DataFrame())
+    impr_error      = raw.get("impr_error")
     gmv2_error      = raw.get("gmv2_error")
 
-    # GMV2 호출은 실패해도 본 대시보드는 보여줘야 하므로 별도 안내
+    if impr_error:
+        st.warning(
+            f"노출 데이터 로드 실패 — CTR이 0으로 표시됩니다.  \n`{impr_error}`",
+            icon="⚠️",
+        )
     if gmv2_error:
         st.warning(
             f"Last-touch GMV2 데이터 로드 실패 — 다른 수치는 정상 표시됩니다.  \n`{gmv2_error}`",
@@ -1090,8 +1383,10 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 집계
     # ──────────────────────────────
-    sec_summary    = build_section_summary(sections_df, sec_click_df, visitor_df, banner_gmv2_df)
-    banner_summary = build_banner_summary(banners_df, banner_pos_df, visitor_df, banner_gmv2_df)
+    sec_summary    = build_section_summary(sections_df, sec_click_df, visitor_df,
+                                            banner_gmv2_df, sec_impr_df)
+    banner_summary = build_banner_summary(banners_df, banner_pos_df, visitor_df,
+                                           banner_gmv2_df, banner_impr_df)
 
     # 섹션 labels (재사용)
     section_labels = sec_summary.apply(
@@ -1114,7 +1409,9 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 탭
     # ──────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(["종합 요약", "섹션별 분석", "배너별 분석", "상세 비교"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["종합 요약", "섹션별 분석", "배너별 분석", "스크롤 뎁스", "상세 비교"]
+    )
 
     # ════════════════════════════════════════════
     # TAB 1 — 종합 요약
@@ -1208,13 +1505,16 @@ def render_dashboard(page_config: dict):
                 )
                 st.markdown(
                     f"- **클릭**: `click_content` 이벤트, {click_note} 조건으로 집계\n"
-                    f"- **CTR**: 클릭 ÷ 페이지 방문자 ({visit_note})\n"
+                    f"- **노출**: `content_impressed` 이벤트, page_name='{page_config['page_name']}' 조건으로 집계 (섹션/배너 위치 단위)\n"
+                    f"- **CTR (현재 방식)**: 순 클릭자 ÷ 순 노출자 — 그 콘텐츠를 본 사람 중 클릭한 비율\n"
+                    f"- (참고) 페이지 방문자 측정용 보조 이벤트: {visit_note}\n"
                     "- **배너**: 섹션 내 배너 순서(0번째, 1번째 ...)로 구분 (배너별 UUID 클릭 미수집)\n"
+                    "- **스크롤 뎁스**: 1번 위치 노출을 100%로 두고 뒤쪽 위치의 상대 비율 — 사용자가 어디까지 보는지 측정\n"
                     "- **GMV2 (7일)**: last-touch 어트리뷰션 — 각 결제마다 결제 직전 7일 이내 "
                     "마지막으로 클릭한 배너 1개에 매출 100% 귀속. 할인·쿠폰·포인트 차감 후 실결제액, "
                     "교환·반품·취소 제외. 비로그인 사용자 클릭은 매출 매칭 불가\n"
-                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭, KST), "
-                    "MySQL `orders_orderitem` (결제, UTC→KST 변환)"
+                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭/노출), "
+                    "MySQL `orders_orderitem` (결제)"
                 )
 
     # ════════════════════════════════════════════
@@ -1471,9 +1771,15 @@ def render_dashboard(page_config: dict):
             st.info("배너를 선택하거나 기간 데이터가 없습니다.")
 
     # ════════════════════════════════════════════
-    # TAB 4 — 상세 비교
+    # TAB 4 — 스크롤 뎁스 (idx별 노출 비율)
     # ════════════════════════════════════════════
     with tab4:
+        render_scroll_depth(sec_summary, banner_summary, page_key=page_key)
+
+    # ════════════════════════════════════════════
+    # TAB 5 — 상세 비교
+    # ════════════════════════════════════════════
+    with tab5:
         st.subheader("섹션 / 배너 상세 비교")
 
         comp_type = st.radio("비교 단위", ["섹션", "배너"], horizontal=True, key=f"comp_radio_{page_key}")
