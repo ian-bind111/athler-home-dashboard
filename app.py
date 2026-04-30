@@ -1215,36 +1215,28 @@ def render_scroll_depth(sec_summary, page_key="home"):
         return
 
     first_unique = float(df.iloc[0].get("unique_impressed", 0) or 0)
-    first_total  = float(df.iloc[0].get("impressions", 0) or 0)
-    if first_unique <= 0 and first_total <= 0:
+    if first_unique <= 0:
         st.info("첫 섹션의 노출 데이터가 없어 뎁스 계산이 불가합니다.")
         return
 
-    # 뎁스 계산
+    # 뎁스 계산 (순 노출자 기준만 사용 — 캐러셀/그리드 노이즈 제거)
     df["섹션 순서"] = df["_order"].astype(int).astype(str) + "번"
     df["섹션명"]    = df.get("memo", "—").astype(str)
-    if first_unique > 0:
-        df["순노출 뎁스(%)"] = (df["unique_impressed"] / first_unique * 100).round(1)
-    else:
-        df["순노출 뎁스(%)"] = 0.0
-    if first_total > 0:
-        df["총노출 뎁스(%)"] = (df["impressions"] / first_total * 100).round(1)
-    else:
-        df["총노출 뎁스(%)"] = 0.0
+    df["뎁스(%)"]   = (df["unique_impressed"] / first_unique * 100).round(1)
 
     # 핵심 KPI: 50% 이하로 떨어지는 첫 섹션
     drop_50_idx = None
     for i, row in df.iterrows():
         if i == 0:
             continue
-        if row["순노출 뎁스(%)"] < 50.0:
+        if row["뎁스(%)"] < 50.0:
             drop_50_idx = i
             break
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("총 섹션 수", f"{len(df):,}")
     k2.metric("1번 섹션 순 노출자", f"{int(first_unique):,}")
-    last_pct = float(df.iloc[-1]["순노출 뎁스(%)"]) if not df.empty else 0
+    last_pct = float(df.iloc[-1]["뎁스(%)"]) if not df.empty else 0
     k3.metric("마지막 섹션까지 뎁스", f"{last_pct:.1f}%",
               delta=f"{int(df.iloc[-1].get('unique_impressed', 0) or 0):,}명",
               delta_color="off")
@@ -1262,14 +1254,14 @@ def render_scroll_depth(sec_summary, page_key="home"):
     st.markdown("---")
     st.markdown("### 📈 페이지 스크롤 뎁스 곡선")
 
-    # 차트
+    # 차트 (순 노출자 기준만 — 사용자 도달률 측정에 정확)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=df["섹션 순서"],
-        y=df["순노출 뎁스(%)"],
+        y=df["뎁스(%)"],
         mode="lines+markers+text",
-        name="순 노출자 기준",
-        text=df["순노출 뎁스(%)"].astype(str) + "%",
+        name="순 노출자 뎁스",
+        text=df["뎁스(%)"].astype(str) + "%",
         textposition="top center",
         line=dict(color="#3182F6", width=3),
         marker=dict(size=10),
@@ -1281,15 +1273,6 @@ def render_scroll_depth(sec_summary, page_key="home"):
             "<extra></extra>"
         ),
     ))
-    if first_total > 0:
-        fig.add_trace(go.Scatter(
-            x=df["섹션 순서"],
-            y=df["총노출 뎁스(%)"],
-            mode="lines+markers",
-            name="총 노출 기준",
-            line=dict(color="#FF9F43", width=2, dash="dot"),
-            marker=dict(size=7),
-        ))
     fig.add_hline(y=100, line_dash="dash", line_color="#888",
                   annotation_text="1번 섹션 = 100%", annotation_position="top right")
     fig.add_hline(y=50, line_dash="dot", line_color="#FF6B6B",
@@ -1297,25 +1280,24 @@ def render_scroll_depth(sec_summary, page_key="home"):
     fig.update_layout(
         title="섹션 순서별 노출 뎁스 (페이지 위 → 아래)",
         xaxis_title="섹션 순서 (페이지 표시 순)",
-        yaxis_title="노출 뎁스 (%)",
+        yaxis_title="순 노출자 뎁스 (%)",
         height=460,
         margin=dict(l=0, r=0, t=50, b=0),
         hovermode="x unified",
-        legend=dict(orientation="h", y=-0.2),
+        showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # 상세표
+    # 상세표 (순 노출자 기준만)
     st.markdown("### 📋 섹션별 뎁스 상세")
     show_cols = ["_order", "섹션명", "elementType", "uiType",
-                 "impressions", "unique_impressed", "순노출 뎁스(%)", "총노출 뎁스(%)",
+                 "unique_impressed", "뎁스(%)",
                  "clicks", "unique_users", "CTR(%)"]
     avail = [c for c in show_cols if c in df.columns]
     rename_map = {
         "_order": "순서",
         "elementType": "유형",
         "uiType": "UI 타입",
-        "impressions": "총 노출",
         "unique_impressed": "순 노출자",
         "clicks": "클릭",
         "unique_users": "순 클릭자",
@@ -1329,9 +1311,9 @@ def render_scroll_depth(sec_summary, page_key="home"):
 
     st.caption(
         "💡 **해석 가이드**: "
-        "이 분석은 페이지 **세로 스크롤 깊이**를 측정해요. "
+        "이 분석은 페이지 **세로 스크롤 깊이**를 **순 노출자(사용자 수) 기준**으로 측정해요. "
         "각 섹션이 화면에 노출되려면 사용자가 거기까지 스크롤해야 하므로, "
-        "뒤쪽 섹션의 노출 비율이 곧 '거기까지 도달한 사용자 비율'이에요. "
+        "뒤쪽 섹션의 순 노출자 비율이 곧 '거기까지 도달한 사용자 비율'이에요. "
         "**최상단 섹션부터 90% 이상 유지되다가 갑자기 떨어지는 지점이 페이지의 이탈 포인트**입니다. "
         "그 위로는 콘텐츠 우선순위가 잘 잡힌 거고, 그 아래는 재배치를 고려해 보세요."
     )
