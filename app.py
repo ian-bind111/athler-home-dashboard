@@ -366,6 +366,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_section_impressions,
             get_banner_impressions_by_position,
             get_user_section_pairs,
+            get_section_swipe_funnel,
             get_banner_last_touch_gmv2,
         )
         page_name = page_config["page_name"]
@@ -379,17 +380,19 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             view_event_name=view_event,
             page_name=view_page_name,
         )
-        # 섹션/배너 노출 + 사용자별 도달 섹션 (실패 시 빈값으로 폴백)
+        # 섹션/배너 노출 + 사용자별 도달 섹션 + 섹션별 스와이프 funnel (실패 시 빈값)
         impr_error = None
         try:
-            sec_impr      = get_section_impressions(start_date, end_date, page_name=page_name)
-            banner_impr   = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
-            user_sec_df   = get_user_section_pairs(start_date, end_date, page_name=page_name)
+            sec_impr        = get_section_impressions(start_date, end_date, page_name=page_name)
+            banner_impr     = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
+            user_sec_df     = get_user_section_pairs(start_date, end_date, page_name=page_name)
+            swipe_funnel_df = get_section_swipe_funnel(start_date, end_date, page_name=page_name)
         except Exception as e:
-            sec_impr      = pd.DataFrame()
-            banner_impr   = pd.DataFrame()
-            user_sec_df   = pd.DataFrame()
-            impr_error    = f"{type(e).__name__}: {e}"
+            sec_impr        = pd.DataFrame()
+            banner_impr     = pd.DataFrame()
+            user_sec_df     = pd.DataFrame()
+            swipe_funnel_df = pd.DataFrame()
+            impr_error      = f"{type(e).__name__}: {e}"
         # Last-touch GMV2 (클릭 후 7일 이내 결제 귀속): 실패해도 본 데이터 유지
         gmv2_error = None
         try:
@@ -398,15 +401,16 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             banner_gmv2 = pd.DataFrame()
             gmv2_error = f"{type(e).__name__}: {e}"
         return {
-            "section_clicks":     sec_clicks,
-            "banner_pos_clicks":  banner_pos,
-            "home_visitors":      visitors,
+            "section_clicks":      sec_clicks,
+            "banner_pos_clicks":   banner_pos,
+            "home_visitors":       visitors,
             "section_impressions": sec_impr,
             "banner_impressions":  banner_impr,
             "user_section_pairs":  user_sec_df,
-            "impr_error":         impr_error,
-            "banner_gmv2":        banner_gmv2,
-            "gmv2_error":         gmv2_error,
+            "swipe_funnel":        swipe_funnel_df,
+            "impr_error":          impr_error,
+            "banner_gmv2":         banner_gmv2,
+            "gmv2_error":          gmv2_error,
             "source": "live",
         }
     except Exception as e:
@@ -536,6 +540,28 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         columns=["distinct_id", "section_uuid"]
     )
 
+    # 데모용 섹션별 스와이프 funnel (max_idx 분포)
+    swipe_funnel_rows = []
+    for _, sec in sections_df.iterrows():
+        bcount = int(sec.get("banner_count", 0) or 0)
+        if bcount <= 1:
+            continue
+        sec_uuid = str(sec["section_uuid"])
+        # 사용자 max_idx 분포: 작을수록 (앞쪽에서 멈춤) 비율 높음
+        for k in range(bcount):
+            # 지수 분포 시뮬: 앞쪽 idx에 머무는 사용자가 많고 뒤로 갈수록 감소
+            user_count = int(rng.integers(50, 500) * (0.85 ** k))
+            if user_count <= 0:
+                continue
+            swipe_funnel_rows.append({
+                "section_uuid": sec_uuid,
+                "max_idx": k,
+                "user_count": user_count,
+            })
+    swipe_funnel_df = pd.DataFrame(swipe_funnel_rows) if swipe_funnel_rows else pd.DataFrame(
+        columns=["section_uuid", "max_idx", "user_count"]
+    )
+
     return {
         "section_clicks": sec_click_df,
         "banner_pos_clicks": banner_pos_df,
@@ -543,6 +569,7 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         "section_impressions": sec_impr_df,
         "banner_impressions": banner_impr_df,
         "user_section_pairs": user_sec_df,
+        "swipe_funnel": swipe_funnel_df,
         "impr_error": None,
         "banner_gmv2": banner_gmv2_df,
         "gmv2_error": None,
@@ -1017,18 +1044,27 @@ def render_section_perf_table(sec_summary):
 # ──────────────────────────────────────────────
 # 9-2a. 스와이프 뎁스 (섹션 안 배너 idx별 노출 비율 — 가로 스와이프 깊이)
 # ──────────────────────────────────────────────
-def render_swipe_depth(sec_summary, banner_summary, page_key="home"):
+def render_swipe_depth(sec_summary, banner_summary, page_key="home", swipe_funnel_df=None):
     """
-    섹션 안에서 idx 1번(=banner_orderIndex 1) 노출을 100%로 두고,
-    뒤쪽 idx(2,3,...)의 상대 노출 비율을 보여줘서 사용자가 어디까지 스와이프했는지 측정.
-    (가로 스와이프 / 캐러셀 영역에 특히 의미 있음)
+    섹션 안 배너 위치(idx)별 깊이 분석. 두 가지 측정 방식 토글 지원:
+    (1) 노출 기준 (impressions/unique_impressed) — 각 idx의 노출 비율 (현재 방식)
+    (2) 유저 도달 Funnel — 각 사용자 max(idx) 기준 누적 (단조 감소)
     """
     st.subheader("🔄 스와이프 뎁스 분석")
     st.caption(
-        "각 섹션의 **1번째 위치 노출**을 100%로 잡고, 같은 섹션 내 뒤쪽 위치의 노출 비율을 보여드려요. "
-        "값이 가파르게 떨어지면 사용자가 그 지점부터 안 보고 이탈한다는 뜻이에요. "
-        "(스와이프 캐러셀 / 가로 스크롤 영역에 특히 의미 있어요.)"
+        "섹션 안에서 사용자가 어디까지 스와이프/스크롤하는지 측정해요. "
+        "**측정 방식**을 토글로 바꿀 수 있어요 — 노출 기준은 컴포넌트 노출 효율 영향을 받고, "
+        "유저 도달 Funnel은 순수 사용자 행동만 반영해 단조 감소 곡선이 나와요."
     )
+
+    # ── 측정 방식 토글
+    mode = st.radio(
+        "측정 방식",
+        ["📊 노출 기준 (각 idx별 본 사용자)", "👣 유저 도달 Funnel (max idx 누적)"],
+        horizontal=True,
+        key=f"swipe_mode_{page_key}",
+    )
+    is_funnel_mode = mode.startswith("👣")
 
     if banner_summary is None or banner_summary.empty:
         st.info("배너 노출 데이터가 없습니다.")
@@ -1149,7 +1185,123 @@ def render_swipe_depth(sec_summary, banner_summary, page_key="home"):
 
     sec_banners["위치"] = sec_banners["_o"].astype(str) + "번"
 
-    # ── 차트
+    if is_funnel_mode:
+        # ── 유저 도달 Funnel 모드 (max(idx) 분포 → reverse cumulative)
+        if swipe_funnel_df is None or swipe_funnel_df.empty:
+            st.info("스와이프 funnel 데이터가 없습니다.")
+            return
+        sf = swipe_funnel_df.copy()
+        sf["section_uuid"] = sf["section_uuid"].astype(str)
+        sf["max_idx"]      = pd.to_numeric(sf["max_idx"], errors="coerce")
+        sf["user_count"]   = pd.to_numeric(sf["user_count"], errors="coerce").fillna(0).astype(int)
+        sf = sf.dropna(subset=["max_idx"])
+        sf = sf[sf["section_uuid"] == sel_uuid].copy()
+        if sf.empty:
+            st.info("이 섹션의 funnel 데이터가 없습니다.")
+            return
+        sf["max_idx"] = sf["max_idx"].astype(int)
+
+        # 모든 idx 위치(섹션 메타 기준 + funnel에 등장한 idx 합집합) 만들기
+        idx_in_meta = sec_banners["_o"].astype(int).tolist()  # 1-based
+        idx_in_meta_zero = [i - 1 for i in idx_in_meta]  # 0-based로
+        idx_in_funnel = sf["max_idx"].astype(int).tolist()
+        all_idx = sorted(set(idx_in_meta_zero) | set(idx_in_funnel))
+
+        # 누적 사용자 수: idx N 이상 도달한 사용자 = sum(user_count where max_idx >= N)
+        sf_by_max = sf.set_index("max_idx")["user_count"].to_dict()
+        total_users = int(sum(sf_by_max.values()))
+        if total_users <= 0:
+            st.info("측정 가능한 사용자가 없습니다.")
+            return
+
+        funnel_rows = []
+        for n in all_idx:
+            reached = sum(c for m, c in sf_by_max.items() if m >= n)
+            funnel_rows.append({
+                "위치":  f"{n + 1}번",  # 표시는 1-based
+                "_o":   n + 1,
+                "도달자": reached,
+                "도달률(%)": round(reached / total_users * 100, 1),
+            })
+        funnel_df = pd.DataFrame(funnel_rows).sort_values("_o")
+
+        # 핵심 KPI
+        drop_50 = None
+        for i, r in funnel_df.iterrows():
+            if r["_o"] == 1:
+                continue
+            if r["도달률(%)"] < 50.0:
+                drop_50 = r
+                break
+        k1, k2, k3 = st.columns(3)
+        k1.metric("측정 사용자 수", f"{total_users:,}")
+        k2.metric("마지막 위치 도달률", f"{float(funnel_df.iloc[-1]['도달률(%)']):.1f}%",
+                  delta=f"{int(funnel_df.iloc[-1]['도달자']):,}명", delta_color="off")
+        if drop_50 is not None:
+            k3.metric("50% 컷오프 위치", f"{int(drop_50['_o'])}번",
+                      delta=f"{int(drop_50['도달자']):,}명까지", delta_color="off")
+        else:
+            k3.metric("50% 컷오프 위치", "없음", delta="모든 위치 ≥50%", delta_color="off")
+
+        st.markdown("---")
+        st.markdown("### 📈 유저 도달 Funnel")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=funnel_df["위치"],
+            y=funnel_df["도달률(%)"],
+            mode="lines+markers+text",
+            text=funnel_df["도달률(%)"].astype(str) + "%",
+            textposition="top center",
+            line=dict(color="#10B981", width=3, shape="hv"),
+            marker=dict(size=10),
+            customdata=funnel_df[["도달자"]],
+            hovertemplate="<b>%{x}</b><br>도달률: %{y}%<br>도달자: %{customdata[0]:,}명<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=funnel_df["위치"], y=funnel_df["도달률(%)"],
+            fill="tozeroy", fillcolor="rgba(16, 185, 129, 0.1)",
+            line=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip",
+        ))
+        fig.add_hline(y=100, line_dash="dash", line_color="#888",
+                      annotation_text="섹션 진입 = 100%", annotation_position="top right")
+        fig.add_hline(y=50, line_dash="dot", line_color="#FF6B6B",
+                      annotation_text="50% 라인", annotation_position="bottom right")
+        fig.update_layout(
+            title=f"{sel_label.split(' — ')[0]} — 유저 도달 Funnel (단조 감소)",
+            xaxis_title="배너 위치",
+            yaxis_title="도달 비율 (%)",
+            yaxis=dict(range=[0, 105]),
+            height=420,
+            margin=dict(l=0, r=0, t=50, b=0),
+            hovermode="x unified",
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ── Funnel 상세표 (배너명 병합 가능하면 같이)
+        funnel_table = funnel_df[["_o", "위치", "도달자", "도달률(%)"]].rename(
+            columns={"_o": "순서"}
+        )
+        # 배너명 매핑 (sec_banners에서)
+        if "banner_title" in sec_banners.columns:
+            name_map = dict(zip(sec_banners["_o"].astype(int), sec_banners["banner_title"]))
+            funnel_table["배너명"] = funnel_table["순서"].map(
+                lambda o: name_map.get(int(o), "—") if not pd.isna(name_map.get(int(o))) else "—"
+            )
+            funnel_table = funnel_table[["순서", "위치", "배너명", "도달자", "도달률(%)"]]
+        st.markdown("**위치별 도달 상세**")
+        st.dataframe(funnel_table, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "💡 **유저 도달 Funnel 해석**: 단조 감소가 보장돼서 **이탈 지점이 명확**해요. "
+            "각 사용자의 max(banner_idx)를 구해 'N번 이상까지 도달한 사용자 비율'을 누적 표시. "
+            "노출 기준과 달리 컴포넌트 효율 영향을 받지 않아 **순수 사용자 행동만 측정**돼요. "
+            "특히 캐러셀(`ROUND_SWIPE`)에서 강력합니다."
+        )
+        return  # funnel 모드는 여기서 끝, 노출 기반 차트/표는 그리지 않음
+
+    # ── 차트 (노출 기준)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=sec_banners["위치"],
@@ -1761,15 +1913,16 @@ def render_dashboard(page_config: dict):
     if src == "demo":
         st.caption("※ 아래 수치는 실제 데이터가 아닌 예시입니다.")
 
-    sec_click_df    = raw.get("section_clicks",      pd.DataFrame())
-    banner_pos_df   = raw.get("banner_pos_clicks",   pd.DataFrame())
-    visitor_df      = raw.get("home_visitors",       pd.DataFrame())
-    sec_impr_df     = raw.get("section_impressions", pd.DataFrame())
-    banner_impr_df  = raw.get("banner_impressions",  pd.DataFrame())
-    user_sec_df     = raw.get("user_section_pairs",  pd.DataFrame())
-    banner_gmv2_df  = raw.get("banner_gmv2",         pd.DataFrame())
-    impr_error      = raw.get("impr_error")
-    gmv2_error      = raw.get("gmv2_error")
+    sec_click_df     = raw.get("section_clicks",      pd.DataFrame())
+    banner_pos_df    = raw.get("banner_pos_clicks",   pd.DataFrame())
+    visitor_df       = raw.get("home_visitors",       pd.DataFrame())
+    sec_impr_df      = raw.get("section_impressions", pd.DataFrame())
+    banner_impr_df   = raw.get("banner_impressions",  pd.DataFrame())
+    user_sec_df      = raw.get("user_section_pairs",  pd.DataFrame())
+    swipe_funnel_df  = raw.get("swipe_funnel",        pd.DataFrame())
+    banner_gmv2_df   = raw.get("banner_gmv2",         pd.DataFrame())
+    impr_error       = raw.get("impr_error")
+    gmv2_error       = raw.get("gmv2_error")
 
     if impr_error:
         st.warning(
@@ -2189,7 +2342,8 @@ def render_dashboard(page_config: dict):
     # TAB 6 — 스와이프 뎁스 (섹션 안 idx별, 가로 스와이프 깊이)
     # ════════════════════════════════════════════
     with tab6:
-        render_swipe_depth(sec_summary, banner_summary, page_key=page_key)
+        render_swipe_depth(sec_summary, banner_summary, page_key=page_key,
+                            swipe_funnel_df=swipe_funnel_df)
 
     # ════════════════════════════════════════════
     # TAB 7 — 상세 비교

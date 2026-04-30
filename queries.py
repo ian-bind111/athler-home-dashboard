@@ -311,6 +311,44 @@ LIMIT 5000
     return run_query(sql)
 
 
+def get_section_swipe_funnel(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    각 (사용자, 섹션) 쌍에서 사용자가 도달한 max banner_idx의 분포.
+    Python에서 reverse cumulative sum으로 'idx N 이상 도달한 사용자 수' funnel 계산.
+
+    SQL 단에서 미리 집계해 데이터 크기 작음 (~수백 행).
+
+    반환 컬럼: section_uuid, max_idx, user_count
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+WITH user_max AS (
+    SELECT
+        distinct_id,
+        element_uuid                AS section_uuid,
+        MAX(CAST(idx AS BIGINT))    AS max_idx
+    FROM {TABLE}
+    WHERE {date_filter}
+      AND event IN ('content_impressed', 'product_impressed')
+      AND page_name = '{page_name}'
+      AND element_uuid IS NOT NULL
+      AND idx IS NOT NULL
+      AND distinct_id IS NOT NULL
+      AND distinct_id <> ''
+    GROUP BY distinct_id, element_uuid
+)
+SELECT
+    section_uuid,
+    max_idx,
+    COUNT(*) AS user_count
+FROM user_max
+GROUP BY section_uuid, max_idx
+ORDER BY section_uuid, max_idx
+LIMIT 10000
+    """
+    return run_query(sql)
+
+
 def get_user_section_pairs(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
     사용자(distinct_id) × 섹션(element_uuid)의 DISTINCT 쌍 추출
