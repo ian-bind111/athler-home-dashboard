@@ -1203,11 +1203,16 @@ def render_scroll_depth(sec_summary, page_key="home"):
         df["_order"] = range(len(df))
     df = df.dropna(subset=["_order"]).sort_values("_order").reset_index(drop=True)
 
-    # 노이즈 섹션 제외: 이름 없는 섹션 + elementType이 margin/MARGIN/space 등
+    # 노이즈/개인화 섹션 제외:
+    #   - 이름 없는 섹션
+    #   - 여백/구분선 (MARGIN/SPACE/DIVIDER)
+    #   - 개인화 컴포넌트 (RECENTLY_VIEWED_BRAND 등) — 일부 사용자에게만 노출돼 뎁스 왜곡
     if "memo" in df.columns:
         df = df[df["memo"].fillna("").astype(str).str.strip() != ""]
     if "elementType" in df.columns:
         df = df[~df["elementType"].fillna("").astype(str).str.upper().isin(["MARGIN", "SPACE", "DIVIDER"])]
+    if "uiType" in df.columns:
+        df = df[~df["uiType"].fillna("").astype(str).str.upper().isin(["RECENTLY_VIEWED_BRAND"])]
     df = df.reset_index(drop=True)
 
     if df.empty:
