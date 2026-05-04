@@ -1810,12 +1810,41 @@ def render_dashboard(page_config: dict):
                         )
                         # Redash 데이터 캐시도 비워서 새 메타 기준으로 모든 영역 재계산
                         st.cache_data.clear()
+
+                        # 갱신된 CSV를 git에 자동 저장 → 재접속·재시작 후에도 유지
+                        _csv_files = [
+                            "data/sections.csv",
+                            "data/banners.csv",
+                            "data/outlet_sections.csv",
+                            "data/outlet_banners.csv",
+                        ]
+                        try:
+                            subprocess.run(
+                                ["git", "-C", BASE_DIR, "add"] + _csv_files,
+                                capture_output=True, timeout=15,
+                            )
+                            _today = date.today().strftime("%Y-%m-%d")
+                            _commit = subprocess.run(
+                                ["git", "-C", BASE_DIR, "commit", "-m",
+                                 f"메타 자동 저장 ({_today})"],
+                                capture_output=True, text=True, timeout=15,
+                            )
+                            _git_saved = _commit.returncode == 0
+                            if _git_saved:
+                                subprocess.run(
+                                    ["git", "-C", BASE_DIR, "push"],
+                                    capture_output=True, timeout=30,
+                                )
+                        except Exception:
+                            _git_saved = False
+
                         msg_lines = [
                             f"- **{p}**: 섹션 {s}개, 배너 {b}개"
                             for p, s, b in results
                         ]
+                        _save_note = " · 영구 저장됨" if _git_saved else ""
                         st.success(
-                            "✅ 새로고침 완료 (홈/아울렛 모든 영역 적용됨)\n\n"
+                            f"✅ 새로고침 완료{_save_note} (홈/아울렛 모든 영역 적용됨)\n\n"
                             + "\n".join(msg_lines)
                         )
                         if not errors:
