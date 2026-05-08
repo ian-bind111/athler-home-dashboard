@@ -684,7 +684,14 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
     result = banners_df.copy()
     result["section_uuid"] = result["section_uuid"].astype(str)
     if "banner_idx" not in result.columns:
-        result["banner_idx"] = "0"
+        if "banner_orderIndex" in result.columns:
+            # banners.csv의 orderIndex는 1-based, Athena idx는 0-based → 1 빼서 맞춤
+            result["banner_idx"] = (
+                pd.to_numeric(result["banner_orderIndex"], errors="coerce")
+                .sub(1).fillna(0).astype(int).astype(str)
+            )
+        else:
+            result["banner_idx"] = "0"
     result["banner_idx"] = result["banner_idx"].astype(str)
 
     result = result.merge(agg, on=["section_uuid", "banner_idx"], how="left")
