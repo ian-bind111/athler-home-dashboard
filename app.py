@@ -68,8 +68,8 @@ PAGE_OUTLET = {
     "icon": "🛍️",
     "page_uuid": "ca14a954-d190-464a-a77b-1cbfcf8c042e",
     "page_name": "outlet",
-    "view_event": "navigate_home-outlet",  # 아울렛 탭 진입 이벤트 (페이지 UV 기준)
-    "view_page_name": None,                # navigate 이벤트는 page_name 필터 불필요
+    "view_event": "content_impressed",  # 홈과 동일 기준 — 외부 유입 포함
+    "view_page_name": "outlet",         # page_name='outlet' 필터
     "sections_csv": "data/outlet_sections.csv",
     "banners_csv": "data/outlet_banners.csv",
     "page_url": "https://athler.kr/home-outlet",
