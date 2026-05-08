@@ -208,8 +208,8 @@ WHERE {date_filter}
   AND element_uuid IS NOT NULL
   AND idx IS NOT NULL
 GROUP BY 1, 2, 3
-ORDER BY 1 DESC, 4 DESC
-LIMIT 1000
+ORDER BY 1, 2, 3
+LIMIT 10000
     """
     return run_query(sql)
 

@@ -677,7 +677,8 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
             .reset_index()
         )
         agg["section_uuid"] = agg["section_uuid"].astype(str)
-        agg["banner_idx"] = agg["banner_idx"].astype(str)
+        # Athena CAST(idx AS VARCHAR)가 "0.0"/"1.0" 형태로 올 수 있어 정수 문자열로 정규화
+        agg["banner_idx"] = pd.to_numeric(agg["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
     else:
         agg = pd.DataFrame(columns=["section_uuid", "banner_idx", "clicks", "unique_users"])
 
@@ -707,7 +708,7 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
             .reset_index()
         )
         impr_agg["section_uuid"] = impr_agg["section_uuid"].astype(str)
-        impr_agg["banner_idx"]   = impr_agg["banner_idx"].astype(str)
+        impr_agg["banner_idx"] = pd.to_numeric(impr_agg["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
         result = result.merge(impr_agg, on=["section_uuid", "banner_idx"], how="left")
     else:
         result["impressions"]      = 0
