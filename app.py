@@ -1024,8 +1024,15 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
 
 
 def render_section_perf_table(sec_summary):
-    """섹션별 성과 표 (last-touch GMV2 포함)"""
+    """섹션별 성과 표 (last-touch GMV2 + RPC/RPI 포함)"""
     st.subheader("섹션별 성과")
+    df = sec_summary.copy()
+    df["RPC (원)"] = df.apply(
+        lambda r: int(r["section_gmv2"] / r["clicks"]) if r.get("clicks", 0) > 0 and r.get("section_gmv2", 0) > 0 else 0, axis=1
+    )
+    df["RPI (원)"] = df.apply(
+        lambda r: int(r["section_gmv2"] / r["unique_impressed"]) if r.get("unique_impressed", 0) > 0 and r.get("section_gmv2", 0) > 0 else 0, axis=1
+    )
     col_map = {
         "section_id": "섹션 ID",
         "memo": "섹션명",
@@ -1038,9 +1045,11 @@ def render_section_perf_table(sec_summary):
         "CTR(%)": "CTR (%)",
         "section_gmv2": "GMV2 (7일, 원)",
         "section_orders": "결제 건수 (7일)",
+        "RPC (원)": "RPC (원)",
+        "RPI (원)": "RPI (원)",
     }
-    avail = [c for c in col_map if c in sec_summary.columns]
-    show_df = sec_summary[avail].copy()
+    avail = [c for c in col_map if c in df.columns]
+    show_df = df[avail].copy()
     show_df.columns = [col_map[c] for c in avail]
     if "GMV2 (7일, 원)" in show_df.columns:
         show_df["GMV2 (7일, 원)"] = show_df["GMV2 (7일, 원)"].fillna(0).astype(int)
@@ -2058,6 +2067,32 @@ def render_dashboard(page_config: dict):
         kpi_card(kg4, "RPI (노출당 매출)",   rpi, "원", C_RED)
         kpi_card(kg5, "구매 전환율",         conv_pct, "%", accent)
 
+        # ── 섹션별 RPC / RPI 상세 ──────────────
+        if not sec_summary.empty and "section_gmv2" in sec_summary.columns:
+            _s = sec_summary[sec_summary["section_gmv2"] > 0].copy()
+            if not _s.empty:
+                _s["RPC (원)"] = _s.apply(
+                    lambda r: int(r["section_gmv2"] / r["clicks"]) if r.get("clicks", 0) > 0 else 0, axis=1
+                )
+                _s["RPI (원)"] = _s.apply(
+                    lambda r: int(r["section_gmv2"] / r["unique_impressed"]) if r.get("unique_impressed", 0) > 0 else 0, axis=1
+                )
+                _cols = ["memo", "section_gmv2", "section_orders", "clicks", "unique_impressed", "RPC (원)", "RPI (원)"]
+                _disp = _s[[c for c in _cols if c in _s.columns]].copy().rename(columns={
+                    "memo": "섹션명",
+                    "section_gmv2": "GMV2 (7일, 원)",
+                    "section_orders": "결제 건수",
+                    "clicks": "클릭 수",
+                    "unique_impressed": "노출 수 (UV)",
+                })
+                if "GMV2 (7일, 원)" in _disp.columns:
+                    _disp["GMV2 (7일, 원)"] = _disp["GMV2 (7일, 원)"].fillna(0).astype(int)
+                st.markdown("**섹션별 RPC / RPI**")
+                st.dataframe(
+                    _disp.sort_values("GMV2 (7일, 원)", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+
         st.markdown("---")
 
         cl, cr = st.columns(2)
@@ -2141,8 +2176,8 @@ def render_dashboard(page_config: dict):
                     "- **스크롤 뎁스**: 1번 위치 노출을 100%로 두고 뒤쪽 위치의 상대 비율\n"
                     "- **GMV2 (7일)**: last-touch 어트리뷰션 — 결제 직전 7일 이내 마지막 클릭 배너에 매출 100% 귀속. "
                     "할인·쿠폰·포인트 차감 후 실결제액, 교환·반품·취소 제외. 비로그인 클릭은 매칭 불가\n"
-                    "- **RPC**: 총 기여 GMV2 ÷ 배너 총 클릭 수\n"
-                    "- **RPI**: 총 기여 GMV2 ÷ 섹션 노출 합산 (섹션별 unique_impressed 합산 기준)\n"
+                    "- **RPC**: 섹션 기여 GMV2 ÷ 섹션 클릭 수 (섹션별 개별 계산, 종합은 전체 합산 기준)\n"
+                    "- **RPI**: 섹션 기여 GMV2 ÷ 섹션 노출 수 (섹션별 unique_impressed 기준)\n"
                     "- **구매 전환율**: 페이지 방문자 중 동 기간 내 `complete_order` 이벤트 발생 비율 "
                     "(배너 클릭 여부와 무관, Athena 기반)\n"
                     "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭/노출/전환), "
