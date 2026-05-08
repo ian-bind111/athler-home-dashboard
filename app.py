@@ -68,8 +68,8 @@ PAGE_OUTLET = {
     "icon": "🛍️",
     "page_uuid": "ca14a954-d190-464a-a77b-1cbfcf8c042e",
     "page_name": "outlet",
-    "view_event": "content_impressed",  # outlet은 view_* 없음 → content_impressed 사용
-    "view_page_name": "outlet",         # page_name 필터 추가
+    "view_event": "navigate_home-outlet",  # 아울렛 탭 진입 이벤트 (페이지 UV 기준)
+    "view_page_name": None,                # navigate 이벤트는 page_name 필터 불필요
     "sections_csv": "data/outlet_sections.csv",
     "banners_csv": "data/outlet_banners.csv",
     "page_url": "https://athler.kr/home-outlet",
@@ -368,6 +368,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_user_section_pairs,
             get_section_swipe_funnel,
             get_banner_last_touch_gmv2,
+            get_page_conversion_stats,
         )
         page_name = page_config["page_name"]
         view_event = page_config["view_event"]
@@ -400,6 +401,16 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
         except Exception as e:
             banner_gmv2 = pd.DataFrame()
             gmv2_error = f"{type(e).__name__}: {e}"
+        # 페이지 방문 → 구매 전환율 (Athena complete_order 기반)
+        conv_stats = {"page_visitors": 0, "purchasers": 0, "conversion_rate": 0.0}
+        try:
+            conv_stats = get_page_conversion_stats(
+                start_date, end_date,
+                page_view_event=view_event,
+                page_name_filter=page_config.get("view_page_name"),
+            )
+        except Exception:
+            pass
         return {
             "section_clicks":      sec_clicks,
             "banner_pos_clicks":   banner_pos,
@@ -411,6 +422,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             "impr_error":          impr_error,
             "banner_gmv2":         banner_gmv2,
             "gmv2_error":          gmv2_error,
+            "page_conversion":     conv_stats,
             "source": "live",
         }
     except Exception as e:
@@ -562,6 +574,8 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         columns=["section_uuid", "max_idx", "user_count"]
     )
 
+    demo_visitors = int(visitor_df["unique_visitors"].sum()) if not visitor_df.empty else 50000
+    demo_purchasers = int(demo_visitors * rng.uniform(0.03, 0.08))
     return {
         "section_clicks": sec_click_df,
         "banner_pos_clicks": banner_pos_df,
@@ -573,6 +587,11 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         "impr_error": None,
         "banner_gmv2": banner_gmv2_df,
         "gmv2_error": None,
+        "page_conversion": {
+            "page_visitors":   demo_visitors,
+            "purchasers":      demo_purchasers,
+            "conversion_rate": round(demo_purchasers / demo_visitors * 100, 2),
+        },
         "source": "demo",
     }
 
@@ -1952,6 +1971,7 @@ def render_dashboard(page_config: dict):
     banner_gmv2_df   = raw.get("banner_gmv2",         pd.DataFrame())
     impr_error       = raw.get("impr_error")
     gmv2_error       = raw.get("gmv2_error")
+    page_conversion  = raw.get("page_conversion", {"page_visitors": 0, "purchasers": 0, "conversion_rate": 0.0})
 
     if impr_error:
         st.warning(
@@ -2010,8 +2030,8 @@ def render_dashboard(page_config: dict):
         total_ban_clicks = int(banner_summary["clicks"].sum())
         active_sections  = int((sec_summary["clicks"] > 0).sum())
 
-        visitor_label = "순 방문자" if page_config["page_name"] == "home" else "콘텐츠 노출 유저"
-        pv_label = "페이지뷰" if page_config["page_name"] == "home" else "콘텐츠 노출 이벤트"
+        visitor_label = "순 방문자"
+        pv_label = "페이지뷰"
 
         k1, k2, k3, k4, k5 = st.columns(5)
         kpi_card(k1, f"{page_config['label']} {visitor_label}", total_visitors, "명", accent)
@@ -2019,6 +2039,24 @@ def render_dashboard(page_config: dict):
         kpi_card(k3, "섹션 총 클릭", total_sec_clicks, "회", C_ORANGE)
         kpi_card(k4, "배너 총 클릭", total_ban_clicks, "회", C_RED)
         kpi_card(k5, "클릭 발생 섹션 수", active_sections, "개", C_GREEN)
+
+        # ── GMV2 / RPC / RPI / 구매 전환율 ──────────────
+        total_gmv2      = sec_summary["section_gmv2"].sum()
+        total_orders    = sec_summary["section_orders"].sum()
+        total_impr_sum  = sec_summary["unique_impressed"].sum()
+        rpc = int(total_gmv2 / total_ban_clicks) if total_ban_clicks > 0 else 0
+        rpi = int(total_gmv2 / total_impr_sum)   if total_impr_sum  > 0 else 0
+        conv_pct        = page_conversion.get("conversion_rate", 0.0)
+        purchasers      = page_conversion.get("purchasers", 0)
+
+        st.markdown("---")
+        st.subheader("기여 매출 및 전환")
+        kg1, kg2, kg3, kg4, kg5 = st.columns(5)
+        kpi_card(kg1, "총 기여 GMV2 (7일)", int(total_gmv2), "원", C_GREEN)
+        kpi_card(kg2, "기여 주문 수",        int(total_orders), "건", C_PURPLE)
+        kpi_card(kg3, "RPC (클릭당 매출)",   rpc, "원", C_ORANGE)
+        kpi_card(kg4, "RPI (노출당 매출)",   rpi, "원", C_RED)
+        kpi_card(kg5, "구매 전환율",         conv_pct, "%", accent)
 
         st.markdown("---")
 
@@ -2084,22 +2122,31 @@ def render_dashboard(page_config: dict):
         if src == "live":
             with st.expander("데이터 측정 방식 안내"):
                 click_note = f"page_name='{page_config['page_name']}'"
+                visit_event = page_config['view_event']
                 visit_note = (
-                    f"event='{page_config['view_event']}'" +
+                    f"`{visit_event}`" +
                     (f", page_name='{page_config['view_page_name']}'" if page_config.get('view_page_name') else "")
                 )
+                outlet_note = (
+                    "\n- **아울렛 순 방문자**: `navigate_home-outlet` 이벤트 (아울렛 탭 진입 시 발생). "
+                    "외부 직접 유입은 잡히지 않을 수 있어 홈 방문자와 절대값 직접 비교는 주의 필요\n"
+                    if page_config["page_name"] == "outlet" else ""
+                )
                 st.markdown(
+                    f"- **순 방문자**: {visit_note} 이벤트 기준 UV{outlet_note}"
                     f"- **클릭**: `click_content` 이벤트, {click_note} 조건으로 집계\n"
                     f"- **노출**: `content_impressed` 이벤트, page_name='{page_config['page_name']}' 조건으로 집계 (섹션/배너 위치 단위)\n"
-                    f"- **CTR (현재 방식)**: 순 클릭자 ÷ 순 노출자 — 그 콘텐츠를 본 사람 중 클릭한 비율\n"
-                    f"- (참고) 페이지 방문자 측정용 보조 이벤트: {visit_note}\n"
-                    "- **배너**: 섹션 내 배너 순서(0번째, 1번째 ...)로 구분 (배너별 UUID 클릭 미수집)\n"
-                    "- **스크롤 뎁스**: 1번 위치 노출을 100%로 두고 뒤쪽 위치의 상대 비율 — 사용자가 어디까지 보는지 측정\n"
-                    "- **GMV2 (7일)**: last-touch 어트리뷰션 — 각 결제마다 결제 직전 7일 이내 "
-                    "마지막으로 클릭한 배너 1개에 매출 100% 귀속. 할인·쿠폰·포인트 차감 후 실결제액, "
-                    "교환·반품·취소 제외. 비로그인 사용자 클릭은 매출 매칭 불가\n"
-                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭/노출), "
-                    "MySQL `orders_orderitem` (결제)"
+                    f"- **CTR**: 순 클릭자 ÷ 순 노출자 — 그 콘텐츠를 본 사람 중 클릭한 비율\n"
+                    "- **배너**: 섹션 내 배너 순서(0번째, 1번째 ...)로 구분\n"
+                    "- **스크롤 뎁스**: 1번 위치 노출을 100%로 두고 뒤쪽 위치의 상대 비율\n"
+                    "- **GMV2 (7일)**: last-touch 어트리뷰션 — 결제 직전 7일 이내 마지막 클릭 배너에 매출 100% 귀속. "
+                    "할인·쿠폰·포인트 차감 후 실결제액, 교환·반품·취소 제외. 비로그인 클릭은 매칭 불가\n"
+                    "- **RPC**: 총 기여 GMV2 ÷ 배너 총 클릭 수\n"
+                    "- **RPI**: 총 기여 GMV2 ÷ 섹션 노출 합산 (섹션별 unique_impressed 합산 기준)\n"
+                    "- **구매 전환율**: 페이지 방문자 중 동 기간 내 `complete_order` 이벤트 발생 비율 "
+                    "(배너 클릭 여부와 무관, Athena 기반)\n"
+                    "- 데이터 기준: AWS Athena `bind_event_log_compacted` (클릭/노출/전환), "
+                    "MySQL `orders_orderitem` (GMV2 결제)"
                 )
 
     # ════════════════════════════════════════════

@@ -262,6 +262,58 @@ def get_home_visitors(start_date: date, end_date: date) -> pd.DataFrame:
     return get_page_visitors(start_date, end_date, view_event_name="view_home")
 
 
+def get_page_conversion_stats(start_date: date, end_date: date,
+                               page_view_event: str,
+                               page_name_filter: str = None) -> dict:
+    """
+    페이지 방문자 중 동 기간 내 구매 완료한 유저 비율 (Athena 기반).
+
+    - page_visitors: 페이지 진입 이벤트 distinct_id 수
+    - purchasers:    그 중 complete_order 이벤트를 발생시킨 distinct_id 수
+    - conversion_rate: purchasers / page_visitors × 100
+
+    반환: {"page_visitors": int, "purchasers": int, "conversion_rate": float}
+    """
+    date_filter = _date_conditions(start_date, end_date)
+
+    pv_filter = f"event = '{page_view_event}'"
+    if page_name_filter:
+        pv_filter += f" AND page_name = '{page_name_filter}'"
+
+    sql = f"""
+WITH visitors AS (
+    SELECT DISTINCT distinct_id
+    FROM {TABLE}
+    WHERE {date_filter}
+      AND {pv_filter}
+),
+buyers AS (
+    SELECT DISTINCT distinct_id
+    FROM {TABLE}
+    WHERE {date_filter}
+      AND event = 'complete_order'
+)
+SELECT
+    COUNT(v.distinct_id)                                      AS page_visitors,
+    COUNT(b.distinct_id)                                      AS purchasers,
+    ROUND(
+        COUNT(b.distinct_id) * 100.0 / NULLIF(COUNT(v.distinct_id), 0),
+        2
+    )                                                         AS conversion_rate
+FROM visitors v
+LEFT JOIN buyers b ON v.distinct_id = b.distinct_id
+    """
+    df = run_query(sql)
+    if df.empty:
+        return {"page_visitors": 0, "purchasers": 0, "conversion_rate": 0.0}
+    row = df.iloc[0]
+    return {
+        "page_visitors":   int(row.get("page_visitors", 0) or 0),
+        "purchasers":      int(row.get("purchasers", 0) or 0),
+        "conversion_rate": float(row.get("conversion_rate", 0.0) or 0.0),
+    }
+
+
 def get_section_clicks_summary(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
     기간 합산 섹션별 클릭 요약 (빠른 조회용)
