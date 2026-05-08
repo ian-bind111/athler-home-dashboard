@@ -1027,11 +1027,13 @@ def render_section_perf_table(sec_summary):
     """섹션별 성과 표 (last-touch GMV2 + RPC/RPI 포함)"""
     st.subheader("섹션별 성과")
     df = sec_summary.copy()
+    _gmv2 = df["section_gmv2"].fillna(0) if "section_gmv2" in df.columns else 0
+    _impr = df["unique_impressed"] if "unique_impressed" in df.columns else pd.Series(0, index=df.index)
     df["RPC (원)"] = df.apply(
-        lambda r: int(r["section_gmv2"] / r["clicks"]) if r.get("clicks", 0) > 0 and r.get("section_gmv2", 0) > 0 else 0, axis=1
+        lambda r: int(_gmv2[r.name] / r["clicks"]) if r.get("clicks", 0) > 0 and _gmv2[r.name] > 0 else 0, axis=1
     )
     df["RPI (원)"] = df.apply(
-        lambda r: int(r["section_gmv2"] / r["unique_impressed"]) if r.get("unique_impressed", 0) > 0 and r.get("section_gmv2", 0) > 0 else 0, axis=1
+        lambda r: int(_gmv2[r.name] / _impr[r.name]) if _impr[r.name] > 0 and _gmv2[r.name] > 0 else 0, axis=1
     )
     col_map = {
         "section_id": "섹션 ID",
@@ -2068,30 +2070,29 @@ def render_dashboard(page_config: dict):
         kpi_card(kg5, "구매 전환율",         conv_pct, "%", accent)
 
         # ── 섹션별 RPC / RPI 상세 ──────────────
-        if not sec_summary.empty and "section_gmv2" in sec_summary.columns:
-            _s = sec_summary[sec_summary["section_gmv2"] > 0].copy()
-            if not _s.empty:
-                _s["RPC (원)"] = _s.apply(
-                    lambda r: int(r["section_gmv2"] / r["clicks"]) if r.get("clicks", 0) > 0 else 0, axis=1
-                )
-                _s["RPI (원)"] = _s.apply(
-                    lambda r: int(r["section_gmv2"] / r["unique_impressed"]) if r.get("unique_impressed", 0) > 0 else 0, axis=1
-                )
-                _cols = ["memo", "section_gmv2", "section_orders", "clicks", "unique_impressed", "RPC (원)", "RPI (원)"]
-                _disp = _s[[c for c in _cols if c in _s.columns]].copy().rename(columns={
-                    "memo": "섹션명",
-                    "section_gmv2": "GMV2 (7일, 원)",
-                    "section_orders": "결제 건수",
-                    "clicks": "클릭 수",
-                    "unique_impressed": "노출 수 (UV)",
-                })
-                if "GMV2 (7일, 원)" in _disp.columns:
-                    _disp["GMV2 (7일, 원)"] = _disp["GMV2 (7일, 원)"].fillna(0).astype(int)
-                st.markdown("**섹션별 RPC / RPI**")
-                st.dataframe(
-                    _disp.sort_values("GMV2 (7일, 원)", ascending=False),
-                    use_container_width=True, hide_index=True,
-                )
+        if not sec_summary.empty:
+            _s = sec_summary.copy()
+            _gmv2_col = "section_gmv2" in _s.columns
+            _impr_col = "unique_impressed" in _s.columns
+            _s["GMV2 (7일, 원)"] = _s["section_gmv2"].fillna(0).astype(int) if _gmv2_col else 0
+            _s["결제 건수"]       = _s["section_orders"].fillna(0).astype(int) if "section_orders" in _s.columns else 0
+            _s["RPC (원)"] = _s.apply(
+                lambda r: int(r["GMV2 (7일, 원)"] / r["clicks"]) if r.get("clicks", 0) > 0 and r["GMV2 (7일, 원)"] > 0 else 0, axis=1
+            )
+            _s["RPI (원)"] = _s.apply(
+                lambda r: int(r["GMV2 (7일, 원)"] / r["unique_impressed"]) if _impr_col and r.get("unique_impressed", 0) > 0 and r["GMV2 (7일, 원)"] > 0 else 0, axis=1
+            )
+            _cols = ["memo", "GMV2 (7일, 원)", "결제 건수", "clicks", "unique_impressed", "RPC (원)", "RPI (원)"]
+            _disp = _s[[c for c in _cols if c in _s.columns]].copy().rename(columns={
+                "memo": "섹션명",
+                "clicks": "클릭 수",
+                "unique_impressed": "노출 수 (UV)",
+            })
+            st.markdown("**섹션별 RPC / RPI**")
+            st.dataframe(
+                _disp.sort_values("GMV2 (7일, 원)", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
 
         st.markdown("---")
 
