@@ -2088,11 +2088,16 @@ def render_dashboard(page_config: dict):
                 "clicks": "클릭 수",
                 "unique_impressed": "노출 수 (UV)",
             })
-            st.markdown("**섹션별 RPC / RPI**")
-            st.dataframe(
-                _disp.sort_values("GMV2 (7일, 원)", ascending=False),
-                use_container_width=True, hide_index=True,
-            )
+            _disp = _disp[
+                _disp["섹션명"].notna() & (_disp["섹션명"] != "") &
+                (_disp["GMV2 (7일, 원)"] > 0)
+            ]
+            if not _disp.empty:
+                st.markdown("**섹션별 RPC / RPI**")
+                st.dataframe(
+                    _disp.sort_values("GMV2 (7일, 원)", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
 
         st.markdown("---")
 
