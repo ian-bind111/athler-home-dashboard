@@ -760,9 +760,15 @@ def get_daily_section(sec_click_df: pd.DataFrame, section_uuid: str) -> pd.DataF
 def get_daily_banner(banner_pos_df: pd.DataFrame, section_uuid: str, banner_idx: str) -> pd.DataFrame:
     if banner_pos_df.empty:
         return pd.DataFrame()
+    # Athena CAST(idx AS VARCHAR)가 "0.0"/"1.0" 형태로 올 수 있어 정수 문자열로 정규화
+    try:
+        norm_idx = str(int(float(banner_idx)))
+    except (TypeError, ValueError):
+        norm_idx = str(banner_idx)
+    norm_raw_idx = pd.to_numeric(banner_pos_df["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
     mask = (
         (banner_pos_df["section_uuid"] == section_uuid) &
-        (banner_pos_df["banner_idx"].astype(str) == str(banner_idx))
+        (norm_raw_idx == norm_idx)
     )
     sub = banner_pos_df[mask].copy()
     if sub.empty:
