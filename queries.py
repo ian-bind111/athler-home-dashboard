@@ -188,8 +188,7 @@ ORDER BY 1 DESC, 3 DESC
 
 def get_banner_clicks_by_position(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
-    기간별 배너 위치(idx)별 클릭 수 조회
-    - 배너는 section_uuid + idx(순서) 조합으로 식별
+    기간별 배너 위치(idx)별 클릭 수 조회 (하위 호환용 — 신규 코드는 get_banner_clicks_by_content 사용)
     반환 컬럼: event_date, section_uuid, banner_idx, clicks, unique_users
     """
     date_filter = _date_conditions(start_date, end_date)
@@ -206,6 +205,32 @@ WHERE {date_filter}
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
   AND idx IS NOT NULL
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3
+    """
+    return run_query(sql)
+
+
+def get_banner_clicks_by_content(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    content_uuid 기준 배너별 클릭 수 조회
+    - 배너 교체/이동 시 실제 콘텐츠 단위로 정확하게 추적
+    반환 컬럼: event_date, section_uuid, content_uuid, clicks, unique_users
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    CONCAT(year, '-', month, '-', day) AS event_date,
+    element_uuid AS section_uuid,
+    content_uuid,
+    COUNT(*) AS clicks,
+    COUNT(DISTINCT distinct_id) AS unique_users
+FROM {TABLE}
+WHERE {date_filter}
+  AND event = 'click_content'
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+  AND content_uuid IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3
     """
@@ -424,8 +449,7 @@ LIMIT 500000
 
 def get_banner_impressions_by_position(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
-    배너 위치별 노출 수 (content_impressed + product_impressed, idx 단위)
-    PRODUCT 섹션은 idx가 상품 순서를 의미하기도 함 — 배너 그리드/리스트의 위치 단위.
+    배너 위치(idx)별 노출 수 (하위 호환용 — 신규 코드는 get_banner_impressions_by_content 사용)
     반환 컬럼: event_date, section_uuid, banner_idx, impressions, unique_impressed
     """
     date_filter = _date_conditions(start_date, end_date)
@@ -442,6 +466,31 @@ WHERE {date_filter}
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
   AND idx IS NOT NULL
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, 4 DESC
+    """
+    return run_query(sql)
+
+
+def get_banner_impressions_by_content(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
+    """
+    content_uuid 기준 배너별 노출 수 조회
+    반환 컬럼: event_date, section_uuid, content_uuid, impressions, unique_impressed
+    """
+    date_filter = _date_conditions(start_date, end_date)
+    sql = f"""
+SELECT
+    CONCAT(year, '-', month, '-', day) AS event_date,
+    element_uuid                       AS section_uuid,
+    content_uuid,
+    COUNT(*)                           AS impressions,
+    COUNT(DISTINCT distinct_id)        AS unique_impressed
+FROM {TABLE}
+WHERE {date_filter}
+  AND event IN ('content_impressed', 'product_impressed')
+  AND page_name = '{page_name}'
+  AND element_uuid IS NOT NULL
+  AND content_uuid IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY 1 DESC, 4 DESC
     """
@@ -472,21 +521,21 @@ def get_banner_clicks_for_attribution(start_date: date, end_date: date,
     중요: Athena `time` 컬럼은 epoch 밀리초이므로 1000으로 나눠서 초로 통일.
     MySQL UNIX_TIMESTAMP()는 초 단위이므로 같은 단위로 비교 가능.
 
-    반환 컬럼: user_id, section_uuid, banner_idx, click_time (Unix timestamp, 초)
+    반환 컬럼: user_id, section_uuid, content_uuid, click_time (Unix timestamp, 초)
     """
     date_filter = _date_conditions(start_date, end_date)
     sql = f"""
 SELECT
     user_id,
-    element_uuid        AS section_uuid,
-    CAST(idx AS BIGINT) AS banner_idx,
+    element_uuid AS section_uuid,
+    content_uuid,
     CAST(time / 1000 AS BIGINT) AS click_time
 FROM {TABLE}
 WHERE {date_filter}
   AND event = 'click_content'
   AND page_name = '{page_name}'
   AND element_uuid IS NOT NULL
-  AND idx IS NOT NULL
+  AND content_uuid IS NOT NULL
   AND user_id IS NOT NULL
   AND user_id <> ''
 ORDER BY user_id, time
@@ -547,12 +596,12 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
     매칭 키: user_id (Athena event log의 user_id == MySQL users_user.id)
     timezone 혼란 방지를 위해 둘 다 Unix timestamp(초) 정수로 직접 비교.
 
-    clicks_df    : user_id, section_uuid, banner_idx, click_time (Unix sec)
+    clicks_df    : user_id, section_uuid, content_uuid, click_time (Unix sec)
     purchases_df : user_id, ordered_at_ts (Unix sec), order_item_id, payment_amount
 
-    반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
+    반환 컬럼: section_uuid, content_uuid, attributed_gmv2, attributed_orders, attributed_users
     """
-    empty_cols = ["section_uuid", "banner_idx",
+    empty_cols = ["section_uuid", "content_uuid",
                   "attributed_gmv2", "attributed_orders", "attributed_users"]
     if clicks_df is None or clicks_df.empty or purchases_df is None or purchases_df.empty:
         return pd.DataFrame(columns=empty_cols)
@@ -560,8 +609,8 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
     clicks = clicks_df.copy()
     clicks["click_time"] = pd.to_numeric(clicks["click_time"], errors="coerce")
     clicks = clicks.dropna(subset=["click_time"])
-    clicks["user_id"]    = clicks["user_id"].astype(str).str.strip()
-    clicks["banner_idx"] = clicks["banner_idx"].astype(str)
+    clicks["user_id"]     = clicks["user_id"].astype(str).str.strip()
+    clicks["content_uuid"] = clicks["content_uuid"].astype(str)
     clicks = clicks[clicks["user_id"] != ""]
 
     purchases = purchases_df.copy()
@@ -605,7 +654,7 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
         last = candidates.iloc[-1]  # sort_values("click_time") 했으므로 마지막이 최신
         results.append({
             "section_uuid":  last["section_uuid"],
-            "banner_idx":    last["banner_idx"],
+            "content_uuid":  last["content_uuid"],
             "gmv2":          float(p["payment_amount"]),
             "user_id":       uid,
             "order_item_id": p["order_item_id"],
@@ -616,7 +665,7 @@ def compute_banner_last_touch_gmv2(clicks_df: pd.DataFrame,
 
     attr = pd.DataFrame(results)
     summary = (
-        attr.groupby(["section_uuid", "banner_idx"])
+        attr.groupby(["section_uuid", "content_uuid"])
         .agg(
             attributed_gmv2   = ("gmv2",          "sum"),
             attributed_orders = ("order_item_id", "count"),
@@ -633,7 +682,7 @@ def get_banner_last_touch_gmv2(start_date: date, end_date: date,
                                  attribution_window_days: int = 7) -> pd.DataFrame:
     """
     통합 진입점: Athena 클릭 + MySQL 구매를 받아 배너별 last-touch GMV2 반환.
-    반환 컬럼: section_uuid, banner_idx, attributed_gmv2, attributed_orders, attributed_users
+    반환 컬럼: section_uuid, content_uuid, attributed_gmv2, attributed_orders, attributed_users
     """
     clicks_df    = get_banner_clicks_for_attribution(start_date, end_date, page_name)
     purchases_df = get_purchases_for_attribution(start_date, end_date, attribution_window_days)

@@ -361,10 +361,10 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
     try:
         from queries import (
             get_section_clicks,
-            get_banner_clicks_by_position,
+            get_banner_clicks_by_content,
             get_page_visitors,
             get_section_impressions,
-            get_banner_impressions_by_position,
+            get_banner_impressions_by_content,
             get_user_section_pairs,
             get_section_swipe_funnel,
             get_banner_last_touch_gmv2,
@@ -375,7 +375,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
         view_page_name = page_config.get("view_page_name")
 
         sec_clicks    = get_section_clicks(start_date, end_date, page_name=page_name)
-        banner_pos    = get_banner_clicks_by_position(start_date, end_date, page_name=page_name)
+        banner_pos    = get_banner_clicks_by_content(start_date, end_date, page_name=page_name)
         visitors      = get_page_visitors(
             start_date, end_date,
             view_event_name=view_event,
@@ -385,7 +385,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
         impr_error = None
         try:
             sec_impr        = get_section_impressions(start_date, end_date, page_name=page_name)
-            banner_impr     = get_banner_impressions_by_position(start_date, end_date, page_name=page_name)
+            banner_impr     = get_banner_impressions_by_content(start_date, end_date, page_name=page_name)
             user_sec_df     = get_user_section_pairs(start_date, end_date, page_name=page_name)
             swipe_funnel_df = get_section_swipe_funnel(start_date, end_date, page_name=page_name)
         except Exception as e:
@@ -456,17 +456,16 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
             })
     sec_click_df = pd.DataFrame(sec_rows)
 
-    # 배너(위치별) 일별 클릭
+    # 배너(content_uuid별) 일별 클릭
     banner_rows = []
     for _, b in banners_df.iterrows():
         base = max(5, int(rng.integers(10, 500)))
-        idx_val = str(int(b.get("banner_orderIndex", 1)) - 1)
         for d in days_list:
             clicks = max(1, int(base * rng.uniform(0.6, 1.4)))
             banner_rows.append({
                 "event_date": d,
                 "section_uuid": b["section_uuid"],
-                "banner_idx": idx_val,
+                "content_uuid": str(b.get("banner_uuid", "")),
                 "clicks": clicks,
                 "unique_users": int(clicks * rng.uniform(0.7, 0.95)),
             })
@@ -483,17 +482,16 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         })
     visitor_df = pd.DataFrame(visitor_rows)
 
-    # 데모용 last-touch GMV2 (배너별)
+    # 데모용 last-touch GMV2 (배너별 content_uuid 기준)
     gmv2_rows = []
     for _, b in banners_df.iterrows():
-        idx_val = str(int(b.get("banner_orderIndex", 1)) - 1)
         orders = max(0, int(rng.integers(0, 50)))
         if orders == 0:
             continue
         gmv2_rows.append({
-            "section_uuid":     b["section_uuid"],
-            "banner_idx":       idx_val,
-            "attributed_gmv2":  int(orders * rng.integers(30000, 90000)),
+            "section_uuid":      b["section_uuid"],
+            "content_uuid":      str(b.get("banner_uuid", "")),
+            "attributed_gmv2":   int(orders * rng.integers(30000, 90000)),
             "attributed_orders": orders,
             "attributed_users":  int(orders * rng.uniform(0.7, 1.0)),
         })
@@ -519,16 +517,14 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
     banner_impr_rows = []
     for _, b in banners_df.iterrows():
         order_n = int(b.get("banner_orderIndex", 1))
-        # idx가 클수록 노출 수 감소 (스크롤 뎁스 시뮬레이션)
         depth_factor = max(0.05, 1.0 - (order_n - 1) * 0.12)
         base_impr = max(50, int(rng.integers(500, 5000) * depth_factor))
-        idx_val = str(order_n - 1)
         for d in days_list:
             impr = max(5, int(base_impr * rng.uniform(0.7, 1.3)))
             banner_impr_rows.append({
                 "event_date": d,
                 "section_uuid": b["section_uuid"],
-                "banner_idx": idx_val,
+                "content_uuid": str(b.get("banner_uuid", "")),
                 "impressions": impr,
                 "unique_impressed": int(impr * rng.uniform(0.5, 0.8)),
             })
@@ -669,47 +665,47 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
                           visitor_df: pd.DataFrame,
                           banner_gmv2_df: pd.DataFrame = None,
                           banner_impr_df: pd.DataFrame = None) -> pd.DataFrame:
-    """배너(위치 기반) 클릭 합산 + 메타 병합 + CTR(노출 대비) + last-touch GMV2 병합"""
-    if not banner_pos_df.empty and "section_uuid" in banner_pos_df.columns:
+    """배너(content_uuid 기반) 클릭 합산 + 메타 병합 + CTR(노출 대비) + last-touch GMV2 병합
+    banners_df의 banner_uuid == 이벤트 로그의 content_uuid"""
+    # ── 클릭 집계 (content_uuid 기준)
+    if not banner_pos_df.empty and "content_uuid" in banner_pos_df.columns:
         agg = (
-            banner_pos_df.groupby(["section_uuid", "banner_idx"])
+            banner_pos_df.groupby(["section_uuid", "content_uuid"])
             .agg(clicks=("clicks", "sum"), unique_users=("unique_users", "sum"))
             .reset_index()
         )
         agg["section_uuid"] = agg["section_uuid"].astype(str)
-        # Athena CAST(idx AS VARCHAR)가 "0.0"/"1.0" 형태로 올 수 있어 정수 문자열로 정규화
-        agg["banner_idx"] = pd.to_numeric(agg["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
+        agg["content_uuid"] = agg["content_uuid"].astype(str)
+        agg = agg.rename(columns={"content_uuid": "banner_uuid"})
     else:
-        agg = pd.DataFrame(columns=["section_uuid", "banner_idx", "clicks", "unique_users"])
+        agg = pd.DataFrame(columns=["section_uuid", "banner_uuid", "clicks", "unique_users"])
 
     result = banners_df.copy()
     result["section_uuid"] = result["section_uuid"].astype(str)
-    if "banner_idx" not in result.columns:
-        if "banner_orderIndex" in result.columns:
-            # banners.csv의 orderIndex는 1-based, Athena idx는 0-based → 1 빼서 맞춤
-            result["banner_idx"] = (
-                pd.to_numeric(result["banner_orderIndex"], errors="coerce")
-                .sub(1).fillna(0).astype(int).astype(str)
-            )
-        else:
-            result["banner_idx"] = "0"
-    result["banner_idx"] = result["banner_idx"].astype(str)
+    result["banner_uuid"]  = result["banner_uuid"].astype(str)
+    # banner_idx는 표시 순서용으로만 유지
+    if "banner_idx" not in result.columns and "banner_orderIndex" in result.columns:
+        result["banner_idx"] = (
+            pd.to_numeric(result["banner_orderIndex"], errors="coerce")
+            .sub(1).fillna(0).astype(int).astype(str)
+        )
 
-    result = result.merge(agg, on=["section_uuid", "banner_idx"], how="left")
-    result["clicks"] = result["clicks"].fillna(0).astype(int)
+    result = result.merge(agg, on=["section_uuid", "banner_uuid"], how="left")
+    result["clicks"]       = result["clicks"].fillna(0).astype(int)
     result["unique_users"] = result["unique_users"].fillna(0).astype(int)
 
-    # 배너 위치별 노출 데이터 병합
-    if banner_impr_df is not None and not banner_impr_df.empty and "section_uuid" in banner_impr_df.columns:
+    # ── 노출 집계 (content_uuid 기준)
+    if banner_impr_df is not None and not banner_impr_df.empty and "content_uuid" in banner_impr_df.columns:
         impr_agg = (
-            banner_impr_df.groupby(["section_uuid", "banner_idx"])
+            banner_impr_df.groupby(["section_uuid", "content_uuid"])
             .agg(impressions=("impressions", "sum"),
                  unique_impressed=("unique_impressed", "sum"))
             .reset_index()
         )
         impr_agg["section_uuid"] = impr_agg["section_uuid"].astype(str)
-        impr_agg["banner_idx"] = pd.to_numeric(impr_agg["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
-        result = result.merge(impr_agg, on=["section_uuid", "banner_idx"], how="left")
+        impr_agg["content_uuid"] = impr_agg["content_uuid"].astype(str)
+        impr_agg = impr_agg.rename(columns={"content_uuid": "banner_uuid"})
+        result = result.merge(impr_agg, on=["section_uuid", "banner_uuid"], how="left")
     else:
         result["impressions"]      = 0
         result["unique_impressed"] = 0
@@ -717,7 +713,7 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
     result["impressions"]      = result["impressions"].fillna(0).astype(int)
     result["unique_impressed"] = result["unique_impressed"].fillna(0).astype(int)
 
-    # CTR = 순 클릭자 / 순 노출자 × 100 (노출 대비, 배너 위치 단위)
+    # CTR = 순 클릭자 / 순 노출자 × 100
     def _safe_ctr(num, den):
         return round(num / den * 100, 4) if den > 0 else 0.0
     result["CTR(%)"] = result.apply(
@@ -725,15 +721,16 @@ def build_banner_summary(banners_df: pd.DataFrame, banner_pos_df: pd.DataFrame,
         axis=1,
     )
 
-    # ── Last-touch GMV2 병합
-    if banner_gmv2_df is not None and not banner_gmv2_df.empty:
+    # ── Last-touch GMV2 병합 (content_uuid 기준)
+    if banner_gmv2_df is not None and not banner_gmv2_df.empty and "content_uuid" in banner_gmv2_df.columns:
         gmv2 = banner_gmv2_df.copy()
         gmv2["section_uuid"] = gmv2["section_uuid"].astype(str)
-        gmv2["banner_idx"]   = gmv2["banner_idx"].astype(str)
+        gmv2["content_uuid"] = gmv2["content_uuid"].astype(str)
+        gmv2 = gmv2.rename(columns={"content_uuid": "banner_uuid"})
         result = result.merge(
-            gmv2[["section_uuid", "banner_idx",
+            gmv2[["section_uuid", "banner_uuid",
                   "attributed_gmv2", "attributed_orders", "attributed_users"]],
-            on=["section_uuid", "banner_idx"], how="left",
+            on=["section_uuid", "banner_uuid"], how="left",
         )
         result = result.rename(columns={"attributed_users": "gmv2_users"})
     else:
@@ -757,18 +754,12 @@ def get_daily_section(sec_click_df: pd.DataFrame, section_uuid: str) -> pd.DataF
     return sub.groupby("event_date")[["clicks", "unique_users"]].sum().reset_index()
 
 
-def get_daily_banner(banner_pos_df: pd.DataFrame, section_uuid: str, banner_idx: str) -> pd.DataFrame:
-    if banner_pos_df.empty:
+def get_daily_banner(banner_pos_df: pd.DataFrame, section_uuid: str, content_uuid: str) -> pd.DataFrame:
+    if banner_pos_df.empty or "content_uuid" not in banner_pos_df.columns:
         return pd.DataFrame()
-    # Athena CAST(idx AS VARCHAR)가 "0.0"/"1.0" 형태로 올 수 있어 정수 문자열로 정규화
-    try:
-        norm_idx = str(int(float(banner_idx)))
-    except (TypeError, ValueError):
-        norm_idx = str(banner_idx)
-    norm_raw_idx = pd.to_numeric(banner_pos_df["banner_idx"], errors="coerce").fillna(0).astype(int).astype(str)
     mask = (
-        (banner_pos_df["section_uuid"] == section_uuid) &
-        (norm_raw_idx == norm_idx)
+        (banner_pos_df["section_uuid"].astype(str) == str(section_uuid)) &
+        (banner_pos_df["content_uuid"].astype(str) == str(content_uuid))
     )
     sub = banner_pos_df[mask].copy()
     if sub.empty:
@@ -1018,17 +1009,26 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
         )
         st.plotly_chart(fig_b_order, use_container_width=True)
 
-    if not banner_pos_df.empty:
+    if not banner_pos_df.empty and "content_uuid" in banner_pos_df.columns:
         sec_pos = banner_pos_df[banner_pos_df["section_uuid"].astype(str) == sel_uuid].copy()
         if not sec_pos.empty:
             sec_pos["event_date"] = pd.to_datetime(sec_pos["event_date"], errors="coerce")
             sec_pos = sec_pos.dropna(subset=["event_date"])
-            sec_pos["배너 순서"] = (sec_pos["banner_idx"].astype(float).astype(int) + 1).astype(str) + "번"
+            # content_uuid → 배너명 매핑 (sec_banners에서 lookup)
+            cuuid_to_name = {}
+            for _, br in sec_banners.iterrows():
+                cuuid = str(br.get("banner_uuid", ""))
+                title = str(br.get("banner_title", "") or "").strip()
+                order = int(float(br.get("banner_orderIndex", 0) or 0))
+                cuuid_to_name[cuuid] = f"{order}번: {title[:15]}" if title else f"{order}번"
+            sec_pos["배너"] = sec_pos["content_uuid"].astype(str).map(
+                lambda x: cuuid_to_name.get(x, x[:8] + "…")
+            )
             if not sec_pos.empty:
                 fig_b_trend = px.line(
                     sec_pos.sort_values("event_date"),
                     x="event_date", y="clicks",
-                    color="배너 순서",
+                    color="배너",
                     labels={"event_date": "날짜", "clicks": "클릭 수"},
                     markers=True,
                 )
@@ -2029,10 +2029,10 @@ def render_dashboard(page_config: dict):
         axis=1,
     ).tolist()
     b_sec_uuid_list  = banner_summary["section_uuid"].tolist()
-    b_idx_list       = banner_summary["banner_idx"].astype(str).tolist() if "banner_idx" in banner_summary.columns else ["0"] * len(b_labels)
+    b_cuuid_list     = banner_summary["banner_uuid"].astype(str).tolist() if "banner_uuid" in banner_summary.columns else [""] * len(b_labels)
     b_label_to_meta  = {
-        label: (suuid, bidx)
-        for label, suuid, bidx in zip(b_labels, b_sec_uuid_list, b_idx_list)
+        label: (suuid, cuuid)
+        for label, suuid, cuuid in zip(b_labels, b_sec_uuid_list, b_cuuid_list)
     }
 
     # ──────────────────────────────
@@ -2439,8 +2439,8 @@ def render_dashboard(page_config: dict):
         if sel_banners and not banner_pos_df.empty:
             b_trend_rows = []
             for bl in sel_banners:
-                suuid, bidx = b_label_to_meta.get(bl, ("", "0"))
-                t = get_daily_banner(banner_pos_df, suuid, bidx)
+                suuid, cuuid = b_label_to_meta.get(bl, ("", ""))
+                t = get_daily_banner(banner_pos_df, suuid, cuuid)
                 if not t.empty:
                     t["배너"] = bl
                     b_trend_rows.append(t)
