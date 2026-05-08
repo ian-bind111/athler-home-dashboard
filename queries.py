@@ -182,7 +182,6 @@ WHERE {date_filter}
   AND element_uuid IS NOT NULL
 GROUP BY 1, 2
 ORDER BY 1 DESC, 3 DESC
-LIMIT 1000
     """
     return run_query(sql)
 
@@ -209,7 +208,6 @@ WHERE {date_filter}
   AND idx IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3
-LIMIT 10000
     """
     return run_query(sql)
 
@@ -332,7 +330,6 @@ WHERE {date_filter}
   AND element_uuid IS NOT NULL
 GROUP BY 1
 ORDER BY 2 DESC
-LIMIT 200
     """
     return run_query(sql)
 
@@ -358,7 +355,6 @@ WHERE {date_filter}
   AND element_uuid IS NOT NULL
 GROUP BY 1, 2
 ORDER BY 1 DESC, 3 DESC
-LIMIT 5000
     """
     return run_query(sql)
 
@@ -396,7 +392,6 @@ SELECT
 FROM user_max
 GROUP BY section_uuid, max_idx
 ORDER BY section_uuid, max_idx
-LIMIT 10000
     """
     return run_query(sql)
 
@@ -449,7 +444,6 @@ WHERE {date_filter}
   AND idx IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY 1 DESC, 4 DESC
-LIMIT 10000
     """
     return run_query(sql)
 
