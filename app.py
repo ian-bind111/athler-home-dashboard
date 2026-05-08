@@ -2024,9 +2024,9 @@ def render_dashboard(page_config: dict):
     # ──────────────────────────────
     # 탭
     # ──────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["종합 요약", "섹션별 분석", "배너별 분석",
-         "스크롤 뎁스", "스와이프 뎁스", "섹션 노출 뎁스", "상세 비교"]
+         "스크롤 뎁스", "스와이프 뎁스"]
     )
 
     # ════════════════════════════════════════════
@@ -2451,128 +2451,6 @@ def render_dashboard(page_config: dict):
         render_swipe_depth(sec_summary, banner_summary, page_key=page_key,
                             swipe_funnel_df=swipe_funnel_df)
 
-    # ════════════════════════════════════════════
-    # TAB 6 — 섹션 노출 뎁스 (섹션 단위 노출 비율: 각 섹션이 얼마나 노출됐나)
-    # ════════════════════════════════════════════
-    with tab6:
-        render_scroll_depth(sec_summary, page_key=page_key)
-
-    # ════════════════════════════════════════════
-    # TAB 7 — 상세 비교
-    # ════════════════════════════════════════════
-    with tab7:
-        st.subheader("섹션 / 배너 상세 비교")
-
-        comp_type = st.radio("비교 단위", ["섹션", "배너"], horizontal=True, key=f"comp_radio_{page_key}")
-
-        if comp_type == "섹션":
-            options  = section_labels
-            meta_map = label_to_uuid
-            agg_df   = sec_summary.copy()
-            agg_df["__uuid"] = agg_df["section_uuid"]
-            trend_fn = lambda label: get_daily_section(sec_click_df, meta_map.get(label, ""))
-        else:
-            options  = b_labels
-            meta_map = b_label_to_meta
-            agg_df   = banner_summary.copy()
-            agg_df["__uuid"] = agg_df["banner_uuid"]
-            trend_fn = lambda label: get_daily_banner(banner_pos_df, *b_label_to_meta.get(label, ("", "0")))
-
-        selected = st.multiselect(
-            f"{comp_type} 선택 (최대 10개)",
-            options,
-            default=options[:min(5, len(options))],
-            max_selections=10,
-            key=f"comp_select_{page_key}",
-        )
-
-        if selected:
-            st.markdown("**집계 비교**")
-            rows = []
-            for lbl in selected:
-                if comp_type == "섹션":
-                    uuid = meta_map.get(lbl, "")
-                    row = agg_df[agg_df["section_uuid"] == uuid]
-                else:
-                    suuid, bidx = meta_map.get(lbl, ("", "0"))
-                    row = agg_df[
-                        (agg_df["section_uuid"] == suuid) &
-                        (agg_df["banner_idx"].astype(str) == str(bidx))
-                    ] if "section_uuid" in agg_df.columns else pd.DataFrame()
-                if not row.empty:
-                    r = row.iloc[0]
-                    rows.append({
-                        comp_type: lbl,
-                        "클릭 수": int(r.get("clicks", 0)),
-                        "순 클릭자": int(r.get("unique_users", 0)),
-                        "CTR (%)": float(r.get("CTR(%)", 0) or 0),
-                    })
-
-            comp_table = pd.DataFrame(rows)
-            if not comp_table.empty:
-                st.dataframe(comp_table, use_container_width=True, hide_index=True)
-
-                fig_comp = go.Figure()
-                fig_comp.add_trace(go.Bar(
-                    name="클릭 수",
-                    x=comp_table[comp_type],
-                    y=comp_table["클릭 수"],
-                    marker_color=accent, yaxis="y",
-                ))
-                fig_comp.add_trace(go.Scatter(
-                    name="CTR (%)",
-                    x=comp_table[comp_type],
-                    y=comp_table["CTR (%)"],
-                    mode="lines+markers",
-                    marker=dict(size=9, color=C_ORANGE),
-                    yaxis="y2",
-                ))
-                fig_comp.update_layout(
-                    barmode="group",
-                    yaxis=dict(title="클릭 수"),
-                    yaxis2=dict(title="CTR (%)", overlaying="y", side="right"),
-                    height=420,
-                    legend=dict(orientation="h", y=1.05),
-                    margin=dict(l=0, r=0, t=30, b=0),
-                )
-                st.plotly_chart(fig_comp, use_container_width=True)
-
-            st.markdown("**일별 클릭 추이 비교**")
-            trend_rows_comp = []
-            for lbl in selected:
-                t = trend_fn(lbl)
-                if not t.empty:
-                    t["항목"] = lbl
-                    trend_rows_comp.append(t)
-
-            if trend_rows_comp:
-                all_trend = pd.concat(trend_rows_comp, ignore_index=True)
-                fig_ct = px.line(
-                    all_trend, x="event_date", y="clicks",
-                    color="항목",
-                    labels={"event_date": "날짜", "clicks": "클릭 수"},
-                    markers=True,
-                )
-                fig_ct.update_layout(height=380, margin=dict(l=0, r=0, t=0, b=0))
-                st.plotly_chart(fig_ct, use_container_width=True)
-            else:
-                st.info("선택된 항목의 일별 데이터가 없습니다.")
-
-        st.markdown("---")
-
-        st.markdown("**데이터 내보내기**")
-        dl_target = st.selectbox("다운로드 대상", ["섹션 분석 결과", "배너 분석 결과"],
-                                  key=f"dl_target_{page_key}")
-        dl_df = sec_summary if dl_target == "섹션 분석 결과" else banner_summary
-        buf = io.BytesIO()
-        dl_df.to_csv(buf, index=False, encoding="utf-8-sig")
-        st.download_button(
-            label=f"{dl_target} CSV 다운로드",
-            data=buf.getvalue(),
-            file_name=f"{page_config['label']}_{dl_target.replace(' ', '_')}_{start_date}_{end_date}.csv",
-            mime="text/csv",
-            key=f"dl_btn_{page_key}",
-        )
 
     # 푸터
     st.markdown("---")
