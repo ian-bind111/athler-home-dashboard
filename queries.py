@@ -113,7 +113,8 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
         if not job_id:
             raise RuntimeError(f"job_id가 없음: {body}")
 
-        # 3) 폴링
+        # 3) 폴링 — 완료 시 query_result_id 함께 수집
+        query_result_id = None
         start = time.time()
         while time.time() - start < timeout:
             j_resp = requests.get(f"{REDASH_URL}/api/jobs/{job_id}", headers=headers, timeout=15)
@@ -121,6 +122,7 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
             j = j_resp.json().get("job", {})
             status = j.get("status")
             if status == 3:  # 완료
+                query_result_id = j.get("query_result_id")
                 break
             if status == 4:  # 실패
                 raise RuntimeError(f"쿼리 실패: {j.get('error') or j}")
@@ -128,21 +130,18 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
         else:
             raise TimeoutError(f"쿼리 제한 시간({timeout}초) 초과")
 
-        # 4) 결과 조회 (재시도 + Connection:close 로 keep-alive 연결 재사용 방지)
-        result_headers = {**headers, "Connection": "close"}
+        # 4) 결과 조회 — CSV 엔드포인트 우선 (JSON보다 안정적), 실패 시 JSON fallback
         for attempt in range(3):
             try:
-                res_resp = requests.get(
-                    f"{REDASH_URL}/api/queries/{query_id}/results",
-                    headers=result_headers,
-                    timeout=120,
-                    stream=True,
-                )
-                res_resp.raise_for_status()
-                raw = res_resp.content  # 청크를 모두 읽어 메모리에 확보
-                import json as _json
-                rows = _json.loads(raw).get("query_result", {}).get("data", {}).get("rows", [])
-                return pd.DataFrame(rows)
+                # CSV 방식: /api/query_results/{id}.csv
+                if query_result_id:
+                    csv_url = f"{REDASH_URL}/api/query_results/{query_result_id}.csv"
+                else:
+                    csv_url = f"{REDASH_URL}/api/queries/{query_id}/results.csv"
+                csv_resp = requests.get(csv_url, headers=headers, timeout=120)
+                csv_resp.raise_for_status()
+                import io
+                return pd.read_csv(io.StringIO(csv_resp.text))
             except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
                 if attempt == 2:
                     raise
