@@ -93,24 +93,24 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
         if not query_id:
             raise RuntimeError(f"쿼리 생성 응답에 id가 없습니다: {create_resp.text[:300]}")
 
-        # 2) 실행 (job 받음)
+        # 2) 실행 — max_age=0으로 인라인 캐시 결과 비활성화 (반드시 job ID만 받음)
+        # 이유: 캐시된 결과를 인라인 JSON으로 받을 때 응답 크기 때문에 ChunkedEncodingError 발생
         exec_resp = requests.post(
             f"{REDASH_URL}/api/queries/{query_id}/results",
             headers=headers,
-            json={},
+            json={"max_age": 0},
             timeout=30,
         )
         exec_resp.raise_for_status()
         body = exec_resp.json()
 
-        # 캐시된 결과가 바로 올 수도 있음
-        if "query_result" in body:
-            rows = body.get("query_result", {}).get("data", {}).get("rows", [])
-            return pd.DataFrame(rows)
-
         job = body.get("job", {})
         job_id = job.get("id")
         if not job_id:
+            # max_age=0 인데도 인라인 결과가 온 예외 케이스 — 그대로 사용
+            if "query_result" in body:
+                rows = body.get("query_result", {}).get("data", {}).get("rows", [])
+                return pd.DataFrame(rows)
             raise RuntimeError(f"job_id가 없음: {body}")
 
         # 3) 폴링 — 완료 시 query_result_id 함께 수집
