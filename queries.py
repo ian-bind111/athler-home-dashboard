@@ -128,18 +128,22 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
         else:
             raise TimeoutError(f"쿼리 제한 시간({timeout}초) 초과")
 
-        # 4) 결과 조회 (큰 응답 대비 재시도 + 긴 타임아웃)
+        # 4) 결과 조회 (재시도 + Connection:close 로 keep-alive 연결 재사용 방지)
+        result_headers = {**headers, "Connection": "close"}
         for attempt in range(3):
             try:
                 res_resp = requests.get(
                     f"{REDASH_URL}/api/queries/{query_id}/results",
-                    headers=headers,
+                    headers=result_headers,
                     timeout=120,
+                    stream=True,
                 )
                 res_resp.raise_for_status()
-                rows = res_resp.json().get("query_result", {}).get("data", {}).get("rows", [])
+                raw = res_resp.content  # 청크를 모두 읽어 메모리에 확보
+                import json as _json
+                rows = _json.loads(raw).get("query_result", {}).get("data", {}).get("rows", [])
                 return pd.DataFrame(rows)
-            except requests.exceptions.ChunkedEncodingError:
+            except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
                 if attempt == 2:
                     raise
                 time.sleep(3)
