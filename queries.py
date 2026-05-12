@@ -130,19 +130,24 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
         else:
             raise TimeoutError(f"쿼리 제한 시간({timeout}초) 초과")
 
-        # 4) 결과 조회 — CSV 엔드포인트 우선 (JSON보다 안정적), 실패 시 JSON fallback
+        # 4) 결과 조회 — urllib3로 직접 받아서 IncompleteRead 우회
+        import urllib3, io
+        if query_result_id:
+            result_url = f"{REDASH_URL}/api/query_results/{query_result_id}.csv"
+        else:
+            result_url = f"{REDASH_URL}/api/queries/{query_id}/results.csv"
+        http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=10, read=120))
         for attempt in range(3):
             try:
-                # CSV 방식: /api/query_results/{id}.csv
-                if query_result_id:
-                    csv_url = f"{REDASH_URL}/api/query_results/{query_result_id}.csv"
-                else:
-                    csv_url = f"{REDASH_URL}/api/queries/{query_id}/results.csv"
-                csv_resp = requests.get(csv_url, headers=headers, timeout=120)
-                csv_resp.raise_for_status()
-                import io
-                return pd.read_csv(io.StringIO(csv_resp.text))
-            except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
+                ur = http.request(
+                    "GET", result_url,
+                    headers={"Authorization": f"Key {REDASH_API_KEY}"},
+                    preload_content=True,
+                )
+                if ur.status >= 400:
+                    raise RuntimeError(f"결과 조회 실패 HTTP {ur.status}")
+                return pd.read_csv(io.StringIO(ur.data.decode("utf-8")))
+            except Exception as e:
                 if attempt == 2:
                     raise
                 time.sleep(3)
