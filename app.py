@@ -381,8 +381,8 @@ def load_live_data(
         view_event = page_config["view_event"]
         view_page_name = page_config.get("view_page_name")
 
-        # 9개 쿼리를 동시 병렬 실행 (각 쿼리는 독립적이라 동시 호출 가능)
-        with ThreadPoolExecutor(max_workers=9) as ex:
+        # 쿼리 병렬 실행 — max_workers=3 으로 Redash 동시 요청 수 제한 (9이상이면 500 에러)
+        with ThreadPoolExecutor(max_workers=3) as ex:
             f_sec_clicks    = ex.submit(get_section_clicks, start_date, end_date, page_name=page_name)
             f_banner_pos    = ex.submit(get_banner_clicks_by_content, start_date, end_date, page_name=page_name)
             f_visitors      = ex.submit(get_page_visitors, start_date, end_date,
