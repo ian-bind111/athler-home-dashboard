@@ -160,6 +160,23 @@ def run_query(sql: str, data_source_id: int = ATHENA_DATA_SOURCE_ID, timeout: in
                 pass
 
 
+def run_query_chunked(sql_fn, start_date: date, end_date: date, chunk_days: int = 3) -> pd.DataFrame:
+    """
+    날짜 범위를 chunk_days씩 나눠서 여러 번 조회 후 합치기.
+    응답이 큰 쿼리(노출 등)가 IncompleteRead로 실패하는 경우 사용.
+    sql_fn(start, end) → SQL 문자열을 반환하는 callable.
+    """
+    dfs = []
+    cur = start_date
+    while cur <= end_date:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end_date)
+        df = run_query(sql_fn(cur, chunk_end))
+        if not df.empty:
+            dfs.append(df)
+        cur = chunk_end + timedelta(days=1)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
 def _date_conditions(start_date: date, end_date: date) -> str:
     """
     Athena 파티션 필터 생성 (year/month/day 컬럼 기준)
@@ -488,11 +505,12 @@ ORDER BY 1 DESC, 4 DESC
 
 def get_banner_impressions_by_content(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
-    content_uuid 기준 배너별 노출 수 조회
+    content_uuid 기준 배너별 노출 수 조회 (3일 청크로 나눠서 조회 — IncompleteRead 방지)
     반환 컬럼: event_date, section_uuid, content_uuid, impressions, unique_impressed
     """
-    date_filter = _date_conditions(start_date, end_date)
-    sql = f"""
+    def sql_fn(s, e):
+        date_filter = _date_conditions(s, e)
+        return f"""
 SELECT
     CONCAT(year, '-', month, '-', day) AS event_date,
     element_uuid                       AS section_uuid,
@@ -507,8 +525,8 @@ WHERE {date_filter}
   AND content_uuid IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY 1 DESC, 4 DESC
-    """
-    return run_query(sql)
+        """
+    return run_query_chunked(sql_fn, start_date, end_date, chunk_days=3)
 
 
 # ──────────────────────────────────────────────────────────────────
