@@ -452,6 +452,61 @@ ORDER BY section_uuid, max_idx
     return run_query(sql)
 
 
+def get_user_max_depth_distribution(
+    start_date: date,
+    end_date: date,
+    sections_order_map: dict,
+    page_name: str = "home",
+) -> pd.DataFrame:
+    """
+    각 사용자의 max(orderIndex) 분포를 SQL에서 미리 집계 (도달 깊이 funnel용).
+
+    sections_order_map: {section_uuid: orderIndex} - 도달 깊이 계산용 매핑
+        (이미 MARGIN/SPACE/개인화 컴포넌트 필터된 섹션만 포함)
+
+    반환 컬럼: max_order_index (int), user_count (int)
+        예: orderIndex 0~30 범위면 최대 31행 — 매우 작은 응답.
+    """
+    if not sections_order_map:
+        return pd.DataFrame(columns=["max_order_index", "user_count"])
+
+    case_clauses = "\n            ".join(
+        f"WHEN element_uuid = '{uuid}' THEN {int(idx)}"
+        for uuid, idx in sections_order_map.items()
+    )
+    uuid_list = ", ".join(f"'{u}'" for u in sections_order_map.keys())
+    date_filter = _date_conditions(start_date, end_date)
+
+    sql = f"""
+WITH user_max AS (
+    SELECT
+        distinct_id,
+        MAX(
+            CASE
+            {case_clauses}
+            ELSE NULL
+            END
+        ) AS max_order_index
+    FROM {TABLE}
+    WHERE {date_filter}
+      AND event IN ('content_impressed', 'product_impressed')
+      AND page_name = '{page_name}'
+      AND element_uuid IN ({uuid_list})
+      AND distinct_id IS NOT NULL
+      AND distinct_id <> ''
+    GROUP BY distinct_id
+)
+SELECT
+    max_order_index,
+    COUNT(*) AS user_count
+FROM user_max
+WHERE max_order_index IS NOT NULL
+GROUP BY max_order_index
+ORDER BY max_order_index
+    """
+    return run_query(sql)
+
+
 def get_user_section_pairs(start_date: date, end_date: date, page_name: str = "home") -> pd.DataFrame:
     """
     사용자(distinct_id) × 섹션(element_uuid)의 DISTINCT 쌍 추출

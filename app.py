@@ -357,7 +357,12 @@ def redash_configured() -> bool:
 # 5. 실시간 데이터 로드 (Redash)
 # ──────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner="Redash에서 데이터를 불러오는 중입니다...")
-def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
+def load_live_data(
+    start_date: date,
+    end_date: date,
+    page_config: dict,
+    sections_order_pairs: tuple = (),  # ((section_uuid, orderIndex), ...) — 도달 깊이 SQL 집계용
+) -> dict:
     try:
         from concurrent.futures import ThreadPoolExecutor
         from queries import (
@@ -366,11 +371,12 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             get_page_visitors,
             get_section_impressions,
             get_banner_impressions_by_content,
-            get_user_section_pairs,
+            get_user_max_depth_distribution,
             get_section_swipe_funnel,
             get_banner_last_touch_gmv2,
             get_page_conversion_stats,
         )
+        sections_order_map = {uuid: int(idx) for uuid, idx in sections_order_pairs}
         page_name = page_config["page_name"]
         view_event = page_config["view_event"]
         view_page_name = page_config.get("view_page_name")
@@ -383,7 +389,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
                                         view_event_name=view_event, page_name=view_page_name)
             f_sec_impr      = ex.submit(get_section_impressions, start_date, end_date, page_name=page_name)
             f_banner_impr   = ex.submit(get_banner_impressions_by_content, start_date, end_date, page_name=page_name)
-            f_user_sec      = ex.submit(get_user_section_pairs, start_date, end_date, page_name=page_name)
+            f_user_sec      = ex.submit(get_user_max_depth_distribution, start_date, end_date, sections_order_map, page_name=page_name)
             f_swipe_funnel  = ex.submit(get_section_swipe_funnel, start_date, end_date, page_name=page_name)
             f_banner_gmv2   = ex.submit(get_banner_last_touch_gmv2, start_date, end_date, page_name=page_name)
             f_conv_stats    = ex.submit(get_page_conversion_stats, start_date, end_date,
@@ -417,7 +423,7 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
             "home_visitors":       visitors,
             "section_impressions": sec_impr,
             "banner_impressions":  banner_impr,
-            "user_section_pairs":  user_sec_df,
+            "user_max_depth_dist": user_sec_df,
             "swipe_funnel":        swipe_funnel_df,
             "impr_error":          impr_error,
             "banner_gmv2":         banner_gmv2,
@@ -531,22 +537,23 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
     banner_impr_df = pd.DataFrame(banner_impr_rows)
 
     # 데모용 사용자-섹션 쌍 (도달 깊이 분포용 - 위에서 아래로 갈수록 사용자 줄어듦)
+    # 데모용 max_order_index 분포 (max_order_index, user_count) — 운영 데이터 형식과 동일
     n_users = 5000
-    user_sec_pairs = []
     sections_sorted = sections_df.sort_values("orderIndex") if "orderIndex" in sections_df.columns else sections_df
-    for ui in range(n_users):
-        # 각 사용자가 도달하는 깊이를 지수 분포로 시뮬레이션
+    valid_orders = []
+    if "orderIndex" in sections_sorted.columns:
+        valid_orders = [int(o) for o in sections_sorted["orderIndex"].dropna().tolist()]
+    depth_counts = {}
+    for _ in range(n_users):
         max_depth = max(1, int(rng.exponential(scale=8)))
-        max_depth = min(max_depth, len(sections_sorted))
-        user_id = f"demo_user_{ui}"
-        for j in range(max_depth):
-            user_sec_pairs.append({
-                "distinct_id": user_id,
-                "section_uuid": str(sections_sorted.iloc[j]["section_uuid"]),
-            })
-    user_sec_df = pd.DataFrame(user_sec_pairs) if user_sec_pairs else pd.DataFrame(
-        columns=["distinct_id", "section_uuid"]
-    )
+        if valid_orders:
+            max_order = valid_orders[min(max_depth - 1, len(valid_orders) - 1)]
+        else:
+            max_order = max_depth
+        depth_counts[max_order] = depth_counts.get(max_order, 0) + 1
+    user_sec_df = pd.DataFrame(
+        [{"max_order_index": k, "user_count": v} for k, v in sorted(depth_counts.items())]
+    ) if depth_counts else pd.DataFrame(columns=["max_order_index", "user_count"])
 
     # 데모용 섹션별 스와이프 funnel (max_idx 분포)
     swipe_funnel_rows = []
@@ -578,7 +585,7 @@ def make_demo_data(sections_df: pd.DataFrame, banners_df: pd.DataFrame,
         "home_visitors": visitor_df,
         "section_impressions": sec_impr_df,
         "banner_impressions": banner_impr_df,
-        "user_section_pairs": user_sec_df,
+        "user_max_depth_dist": user_sec_df,
         "swipe_funnel": swipe_funnel_df,
         "impr_error": None,
         "banner_gmv2": banner_gmv2_df,
@@ -1618,28 +1625,27 @@ def render_user_reach_depth(sections_df, user_sec_df, page_key="home"):
         st.info("필터 적용 후 표시할 섹션이 없습니다.")
         return
 
-    # ── 사용자별 max orderIndex (도달 깊이) 계산
-    pairs = user_sec_df.copy()
-    pairs["section_uuid"] = pairs["section_uuid"].astype(str)
-    pairs = pairs.merge(
-        sec_meta[["section_uuid", "orderIndex"]],
-        on="section_uuid", how="inner",
-    )
-    if pairs.empty:
-        st.info("필터 통과한 섹션과 매칭되는 사용자 노출이 없습니다.")
+    # ── SQL에서 미리 집계된 max_order_index 분포 사용 (max_order_index, user_count)
+    dist = user_sec_df.copy()
+    if "max_order_index" not in dist.columns or "user_count" not in dist.columns:
+        st.info("도달 깊이 분포 데이터 형식이 올바르지 않습니다.")
         return
+    dist["max_order_index"] = pd.to_numeric(dist["max_order_index"], errors="coerce")
+    dist["user_count"] = pd.to_numeric(dist["user_count"], errors="coerce").fillna(0).astype(int)
+    dist = dist.dropna(subset=["max_order_index"]).copy()
+    dist["max_order_index"] = dist["max_order_index"].astype(int)
 
-    user_max_depth = pairs.groupby("distinct_id")["orderIndex"].max()
-    total_users = int(user_max_depth.shape[0])
+    total_users = int(dist["user_count"].sum())
     if total_users == 0:
         st.info("측정 가능한 사용자가 없습니다.")
         return
 
-    # ── 각 섹션 깊이별 funnel 계산: orderIndex >= N 인 사용자 수
+    # ── 각 섹션 깊이별 funnel 계산: max_order_index >= N 인 사용자 수
+    # dist를 max_order_index 내림차순으로 누적합 → 각 depth별 reached_users 계산
     rows = []
     for _, sec in sec_meta.iterrows():
         depth = int(sec["orderIndex"])
-        reached = int((user_max_depth >= depth).sum())
+        reached = int(dist[dist["max_order_index"] >= depth]["user_count"].sum())
         ratio = round(reached / total_users * 100, 1) if total_users > 0 else 0.0
         rows.append({
             "depth_label": f"{depth}번",
@@ -1958,7 +1964,22 @@ def render_dashboard(page_config: dict):
     # 이벤트 데이터 로드
     # ──────────────────────────────
     if redash_configured():
-        raw = load_live_data(start_date, end_date, page_config)
+        # 도달 깊이 SQL 집계용 매핑 — MARGIN/SPACE/개인화 컴포넌트 제외
+        sections_order_pairs = ()
+        if sections_df is not None and not sections_df.empty and "orderIndex" in sections_df.columns:
+            _sec = sections_df.copy()
+            if "memo" in _sec.columns:
+                _sec = _sec[_sec["memo"].fillna("").astype(str).str.strip() != ""]
+            if "elementType" in _sec.columns:
+                _sec = _sec[~_sec["elementType"].fillna("").astype(str).str.upper().isin(["MARGIN", "SPACE", "DIVIDER"])]
+            if "uiType" in _sec.columns:
+                _sec = _sec[~_sec["uiType"].fillna("").astype(str).str.upper().isin(["RECENTLY_VIEWED_BRAND", "BEST_PRODUCT_SECTION"])]
+            _sec = _sec.dropna(subset=["section_uuid", "orderIndex"])
+            sections_order_pairs = tuple(
+                (str(r["section_uuid"]), int(r["orderIndex"]))
+                for _, r in _sec.iterrows()
+            )
+        raw = load_live_data(start_date, end_date, page_config, sections_order_pairs)
     else:
         raw = {"source": "no_config"}
 
@@ -1991,7 +2012,7 @@ def render_dashboard(page_config: dict):
     visitor_df       = raw.get("home_visitors",       pd.DataFrame())
     sec_impr_df      = raw.get("section_impressions", pd.DataFrame())
     banner_impr_df   = raw.get("banner_impressions",  pd.DataFrame())
-    user_sec_df      = raw.get("user_section_pairs",  pd.DataFrame())
+    user_sec_df      = raw.get("user_max_depth_dist", pd.DataFrame())
     swipe_funnel_df  = raw.get("swipe_funnel",        pd.DataFrame())
     banner_gmv2_df   = raw.get("banner_gmv2",         pd.DataFrame())
     impr_error       = raw.get("impr_error")
