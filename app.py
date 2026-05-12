@@ -356,9 +356,10 @@ def redash_configured() -> bool:
 # ──────────────────────────────────────────────
 # 5. 실시간 데이터 로드 (Redash)
 # ──────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner="Redash에서 데이터를 불러오는 중입니다...")
+@st.cache_data(ttl=600, show_spinner="Redash에서 데이터를 불러오는 중입니다...")
 def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
     try:
+        from concurrent.futures import ThreadPoolExecutor
         from queries import (
             get_section_clicks,
             get_banner_clicks_by_content,
@@ -374,43 +375,42 @@ def load_live_data(start_date: date, end_date: date, page_config: dict) -> dict:
         view_event = page_config["view_event"]
         view_page_name = page_config.get("view_page_name")
 
-        sec_clicks    = get_section_clicks(start_date, end_date, page_name=page_name)
-        banner_pos    = get_banner_clicks_by_content(start_date, end_date, page_name=page_name)
-        visitors      = get_page_visitors(
-            start_date, end_date,
-            view_event_name=view_event,
-            page_name=view_page_name,
-        )
-        # 섹션/배너 노출 + 사용자별 도달 섹션 + 섹션별 스와이프 funnel (실패 시 빈값)
-        impr_error = None
-        try:
-            sec_impr        = get_section_impressions(start_date, end_date, page_name=page_name)
-            banner_impr     = get_banner_impressions_by_content(start_date, end_date, page_name=page_name)
-            user_sec_df     = get_user_section_pairs(start_date, end_date, page_name=page_name)
-            swipe_funnel_df = get_section_swipe_funnel(start_date, end_date, page_name=page_name)
-        except Exception as e:
-            sec_impr        = pd.DataFrame()
-            banner_impr     = pd.DataFrame()
-            user_sec_df     = pd.DataFrame()
-            swipe_funnel_df = pd.DataFrame()
-            impr_error      = f"{type(e).__name__}: {e}"
-        # Last-touch GMV2 (클릭 후 7일 이내 결제 귀속): 실패해도 본 데이터 유지
-        gmv2_error = None
-        try:
-            banner_gmv2 = get_banner_last_touch_gmv2(start_date, end_date, page_name=page_name)
-        except Exception as e:
-            banner_gmv2 = pd.DataFrame()
-            gmv2_error = f"{type(e).__name__}: {e}"
-        # 페이지 방문 → 구매 전환율 (Athena complete_order 기반)
-        conv_stats = {"page_visitors": 0, "purchasers": 0, "conversion_rate": 0.0}
-        try:
-            conv_stats = get_page_conversion_stats(
-                start_date, end_date,
-                page_view_event=view_event,
-                page_name_filter=page_config.get("view_page_name"),
-            )
-        except Exception:
-            pass
+        # 9개 쿼리를 동시 병렬 실행 (각 쿼리는 독립적이라 동시 호출 가능)
+        with ThreadPoolExecutor(max_workers=9) as ex:
+            f_sec_clicks    = ex.submit(get_section_clicks, start_date, end_date, page_name=page_name)
+            f_banner_pos    = ex.submit(get_banner_clicks_by_content, start_date, end_date, page_name=page_name)
+            f_visitors      = ex.submit(get_page_visitors, start_date, end_date,
+                                        view_event_name=view_event, page_name=view_page_name)
+            f_sec_impr      = ex.submit(get_section_impressions, start_date, end_date, page_name=page_name)
+            f_banner_impr   = ex.submit(get_banner_impressions_by_content, start_date, end_date, page_name=page_name)
+            f_user_sec      = ex.submit(get_user_section_pairs, start_date, end_date, page_name=page_name)
+            f_swipe_funnel  = ex.submit(get_section_swipe_funnel, start_date, end_date, page_name=page_name)
+            f_banner_gmv2   = ex.submit(get_banner_last_touch_gmv2, start_date, end_date, page_name=page_name)
+            f_conv_stats    = ex.submit(get_page_conversion_stats, start_date, end_date,
+                                        page_view_event=view_event,
+                                        page_name_filter=page_config.get("view_page_name"))
+
+        def _safe(future, default):
+            try:
+                return future.result(), None
+            except Exception as e:
+                return default, f"{type(e).__name__}: {e}"
+
+        sec_clicks, _    = _safe(f_sec_clicks, pd.DataFrame())
+        banner_pos, _    = _safe(f_banner_pos, pd.DataFrame())
+        visitors, _      = _safe(f_visitors, pd.DataFrame())
+
+        # 노출 관련 4개 — 하나라도 실패 시 그룹 전체 에러 표시 유지
+        sec_impr, e1        = _safe(f_sec_impr, pd.DataFrame())
+        banner_impr, e2     = _safe(f_banner_impr, pd.DataFrame())
+        user_sec_df, e3     = _safe(f_user_sec, pd.DataFrame())
+        swipe_funnel_df, e4 = _safe(f_swipe_funnel, pd.DataFrame())
+        impr_error = next((e for e in (e1, e2, e3, e4) if e), None)
+
+        banner_gmv2, gmv2_error = _safe(f_banner_gmv2, pd.DataFrame())
+
+        conv_stats_default = {"page_visitors": 0, "purchasers": 0, "conversion_rate": 0.0}
+        conv_stats, _ = _safe(f_conv_stats, conv_stats_default)
         return {
             "section_clicks":      sec_clicks,
             "banner_pos_clicks":   banner_pos,
