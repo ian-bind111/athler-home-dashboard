@@ -1021,6 +1021,9 @@ def render_section_drilldown(sec_summary, banner_summary, banner_pos_df, page_ke
         if not sec_pos.empty:
             sec_pos["event_date"] = pd.to_datetime(sec_pos["event_date"], errors="coerce")
             sec_pos = sec_pos.dropna(subset=["event_date"])
+            # sections.csv에 등록된 배너만 표시 (제거된 배너 UUID 필터링)
+            known_uuids = set(sec_banners["banner_uuid"].astype(str))
+            sec_pos = sec_pos[sec_pos["content_uuid"].astype(str).isin(known_uuids)]
             # content_uuid → 배너명 매핑 (sec_banners에서 lookup)
             cuuid_to_name = {}
             for _, br in sec_banners.iterrows():
