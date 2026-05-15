@@ -2449,10 +2449,16 @@ def render_dashboard(page_config: dict):
         st.markdown("---")
 
         st.markdown("**배너 일별 클릭 추이**")
+        # 현재 sections.csv에 등록된 섹션에 속한 배너만 목록에 표시
+        valid_section_uuids = set(sections_df["section_uuid"].astype(str))
+        b_active_labels = [
+            lbl for lbl, s_uuid in zip(b_labels, banner_summary["section_uuid"].astype(str))
+            if s_uuid in valid_section_uuids
+        ]
         sel_banners = st.multiselect(
             "배너 선택 (최대 5개)",
-            b_labels,
-            default=b_labels[:min(3, len(b_labels))],
+            b_active_labels,
+            default=b_active_labels[:min(3, len(b_active_labels))],
             max_selections=5,
             key=f"banner_select_{page_key}",
         )
